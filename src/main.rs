@@ -81,21 +81,26 @@ fn candid_principal_field(response: &str, field: &str) -> Option<String> {
 
 fn resolve_repository(namespace: &str, repository: &str, directory: &str) -> (String, String) {
     let icp = configured("INFINIGIT_ICP_BIN", "infinigit.icp-bin").unwrap_or_else(|| "icp".into());
-    let project_root = configured("INFINIGIT_PROJECT_ROOT", "infinigit.project-root")
-        .unwrap_or_else(|| {
-            fail("InfiniGit local project is not configured; run scripts/start-local.sh")
-        });
     let argument = format!("(\"{namespace}\", \"{repository}\")");
-    let output = Command::new(icp)
-        .args([
-            "canister",
-            "call",
-            directory,
-            "resolve_repository",
-            &argument,
-            "--project-root-override",
-            &project_root,
-        ])
+    let mut command = Command::new(icp);
+    command.args([
+        "canister",
+        "call",
+        directory,
+        "resolve_repository",
+        &argument,
+    ]);
+    if let Some(network) = configured("INFINIGIT_NETWORK", "infinigit.network") {
+        command.args(["--network", &network]);
+        if let Some(root_key) = configured("INFINIGIT_ROOT_KEY", "infinigit.root-key") {
+            command.args(["--root-key", &root_key]);
+        }
+    } else if let Some(project_root) =
+        configured("INFINIGIT_PROJECT_ROOT", "infinigit.project-root")
+    {
+        command.args(["--project-root-override", &project_root]);
+    }
+    let output = command
         .output()
         .unwrap_or_else(|e| fail(format!("cannot query the InfiniGit directory: {e}")));
     if !output.status.success() {
@@ -134,24 +139,65 @@ fn pack_bridge() -> PathBuf {
         })
 }
 
-fn sync_from_canister(canister: &str, owner: &str, repository: &str, repo: &Path) {
-    let status = Command::new(pack_bridge())
-        .args(["materialize", canister, owner, repository])
-        .arg(repo)
+fn run_pack(
+    action: &str,
+    canister: &str,
+    owner: &str,
+    repository: &str,
+    repo: &Path,
+    project_root: Option<&Path>,
+) -> bool {
+    let mut command = Command::new(pack_bridge());
+    command
+        .args([action, canister, owner, repository])
+        .arg(repo);
+    if let Some(root) = project_root {
+        command
+            .current_dir(root)
+            .env("INFINIGIT_PROJECT_ROOT", root);
+    }
+    if let Some(icp) = configured("INFINIGIT_ICP_BIN", "infinigit.icp-bin") {
+        command.env("INFINIGIT_ICP_BIN", icp);
+    }
+    if let Some(network) = configured("INFINIGIT_NETWORK", "infinigit.network") {
+        command.env("INFINIGIT_NETWORK", network);
+    }
+    if let Some(root_key) = configured("INFINIGIT_ROOT_KEY", "infinigit.root-key") {
+        command.env("INFINIGIT_ROOT_KEY", root_key);
+    }
+    command
         .status()
-        .unwrap_or_else(|e| fail(format!("cannot start pack materializer: {e}")));
-    if !status.success() {
+        .unwrap_or_else(|e| fail(format!("cannot start pack bridge: {e}")))
+        .success()
+}
+
+fn sync_from_canister(
+    canister: &str,
+    owner: &str,
+    repository: &str,
+    repo: &Path,
+    project_root: Option<&Path>,
+) {
+    if !run_pack(
+        "materialize",
+        canister,
+        owner,
+        repository,
+        repo,
+        project_root,
+    ) {
         fail("repository not found")
     }
 }
 
-fn sync_to_canister(canister: &str, owner: &str, repository: &str, repo: &Path) {
-    let status = Command::new(pack_bridge())
-        .args(["upload", canister, owner, repository])
-        .arg(repo)
-        .status()
-        .unwrap_or_else(|e| fail(format!("cannot start pack uploader: {e}")));
-    if !status.success() {
+fn sync_to_canister(
+    canister: &str,
+    owner: &str,
+    repository: &str,
+    repo: &Path,
+    project_root: Option<&Path>,
+) {
+    if !run_pack("upload", canister, owner, repository, repo, project_root) {
         fail("canister rejected push")
     }
 }
@@ -180,6 +226,8 @@ fn main() {
         (namespace.to_owned(), direct_canister)
     };
     let caller = env::var("INFINIGIT_PRINCIPAL").ok();
+    let project_root =
+        configured("INFINIGIT_PROJECT_ROOT", "infinigit.project-root").map(PathBuf::from);
     let root = env::var_os("INFINIGIT_DATA_DIR")
         .map(PathBuf::from)
         .or_else(|| git_config("infinigit.data-dir").map(PathBuf::from))
@@ -191,7 +239,7 @@ fn main() {
             repo.display(),
             canister
         );
-        sync_from_canister(canister, &owner, repository, &repo);
+        sync_from_canister(canister, &owner, repository, &repo, project_root.as_deref());
     }
     if !repo.join("HEAD").is_file() {
         fail(format!("repository does not exist: {}", repo.display()));
@@ -236,7 +284,13 @@ fn main() {
                     .unwrap_or_else(|e| fail(format!("cannot start {service}: {e}")));
                 if status.success() && !reading {
                     if let Some(canister) = canister.as_deref() {
-                        sync_to_canister(canister, &owner, repository, &repo);
+                        sync_to_canister(
+                            canister,
+                            &owner,
+                            repository,
+                            &repo,
+                            project_root.as_deref(),
+                        );
                     }
                 }
                 std::process::exit(status.code().unwrap_or(1));
