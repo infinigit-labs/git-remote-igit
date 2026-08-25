@@ -90,6 +90,9 @@ fn resolve_repository(namespace: &str, repository: &str, directory: &str) -> (St
         "resolve_repository",
         &argument,
     ]);
+    if let Some(identity) = configured("INFINIGIT_IDENTITY", "infinigit.identity") {
+        command.args(["--identity", &identity]);
+    }
     if let Some(network) = configured("INFINIGIT_NETWORK", "infinigit.network") {
         command.args(["--network", &network]);
         if let Some(root_key) = configured("INFINIGIT_ROOT_KEY", "infinigit.root-key") {
@@ -164,6 +167,9 @@ fn run_pack(
     }
     if let Some(root_key) = configured("INFINIGIT_ROOT_KEY", "infinigit.root-key") {
         command.env("INFINIGIT_ROOT_KEY", root_key);
+    }
+    if let Some(identity) = configured("INFINIGIT_IDENTITY", "infinigit.identity") {
+        command.env("INFINIGIT_IDENTITY", identity);
     }
     command
         .status()
