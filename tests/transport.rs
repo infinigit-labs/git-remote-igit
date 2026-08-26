@@ -194,9 +194,9 @@ fn username_clone_resolves_and_materializes_without_a_project_manifest() {
     assert!(initialized.status.success());
 
     let mock_icp = temp.path().join("icp");
-    fs::write(&mock_icp, "#!/usr/bin/env bash\nset -e\n[[ \"$*\" == *'--network http://127.0.0.1:4943'* ]]\n[[ \"$*\" == *'--root-key fetch'* ]]\n[[ \"$*\" == *'--identity infinigit-browser'* ]]\nprintf '%s\\n' 'variant { ok = record { owner = principal \"aaaaa-aa\"; shard = principal \"rrkah-fqaaa-aaaaa-aaaaq-cai\"; visibility = variant { Public } } }'\n").unwrap();
+    fs::write(&mock_icp, "#!/usr/bin/env bash\nset -e\n[[ \"$*\" == *'--network http://127.0.0.1:4943'* ]]\n[[ \"$*\" == *'--root-key fetch'* ]]\n[[ \"$*\" == *'--identity infinigit-browser'* ]]\nprintf '%s\\n' 'variant { ok = record { owner = principal \"aaaaa-aa\"; shard = principal \"rrkah-fqaaa-aaaaa-aaaaq-cai\"; storage_id = \"igit-r-1\"; visibility = variant { Public } } }'\n").unwrap();
     let mock_pack = temp.path().join("infinigit-pack");
-    fs::write(&mock_pack, "#!/usr/bin/env bash\nset -e\ntest \"$1\" = materialize\ntest \"$PWD\" = \"$INFINIGIT_EXPECTED_WORKING_DIRECTORY\"\ntest -z \"${INFINIGIT_PROJECT_ROOT:-}\"\ntest \"$INFINIGIT_NETWORK\" = 'http://127.0.0.1:4943'\ntest \"$INFINIGIT_ROOT_KEY\" = fetch\ntest \"$INFINIGIT_IDENTITY\" = infinigit-browser\nmkdir -p \"$(dirname \"$5\")\"\ncp -R \"$INFINIGIT_TEST_SOURCE\" \"$5\"\n").unwrap();
+    fs::write(&mock_pack, "#!/usr/bin/env bash\nset -e\ntest \"$1\" = materialize\ntest \"$4\" = igit-r-1\ntest \"$PWD\" = \"$INFINIGIT_EXPECTED_WORKING_DIRECTORY\"\ntest -z \"${INFINIGIT_PROJECT_ROOT:-}\"\ntest \"$INFINIGIT_NETWORK\" = 'http://127.0.0.1:4943'\ntest \"$INFINIGIT_ROOT_KEY\" = fetch\ntest \"$INFINIGIT_IDENTITY\" = infinigit-browser\nmkdir -p \"$(dirname \"$5\")\"\ncp -R \"$INFINIGIT_TEST_SOURCE\" \"$5\"\n").unwrap();
     fs::set_permissions(&mock_icp, fs::Permissions::from_mode(0o755)).unwrap();
     fs::set_permissions(&mock_pack, fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -232,5 +232,5 @@ fn username_clone_resolves_and_materializes_without_a_project_manifest() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(clone.join(".git").is_dir());
-    assert!(cache.join("aaaaa-aa/demo.git/HEAD").is_file());
+    assert!(cache.join("alice-dev/demo.git/HEAD").is_file());
 }

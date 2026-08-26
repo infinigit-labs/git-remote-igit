@@ -16,19 +16,21 @@ fn fail(message: impl AsRef<str>) -> ! {
     std::process::exit(1)
 }
 
+fn valid_atom(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+        && !value.starts_with('.')
+        && !value.ends_with('.')
+}
+
 fn parse_remote(url: &str) -> Result<(Option<&str>, &str, &str), String> {
     let value = url
         .strip_prefix("igit://")
         .or_else(|| url.strip_prefix("igit::"))
         .ok_or_else(|| "remote must use igit://<host>/<username>/<repository>".to_string())?;
-    let valid_atom = |s: &str| {
-        !s.is_empty()
-            && s.len() <= 128
-            && s.bytes()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
-            && !s.starts_with('.')
-            && !s.ends_with('.')
-    };
     let parts = value.split('/').collect::<Vec<_>>();
     let (host, namespace, repository) = match parts.as_slice() {
         [namespace, repository] => (None, *namespace, *repository),
@@ -79,7 +81,17 @@ fn candid_principal_field(response: &str, field: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn resolve_repository(namespace: &str, repository: &str, directory: &str) -> (String, String) {
+fn candid_text_field(response: &str, field: &str) -> Option<String> {
+    let marker = format!("{field} = \"");
+    response
+        .split(&marker)
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .filter(|value| valid_atom(value))
+        .map(str::to_owned)
+}
+
+fn resolve_repository(namespace: &str, repository: &str, directory: &str) -> (String, String, String) {
     let icp = configured("INFINIGIT_ICP_BIN", "infinigit.icp-bin").unwrap_or_else(|| "icp".into());
     let argument = format!("(\"{namespace}\", \"{repository}\")");
     let mut command = Command::new(icp);
@@ -118,7 +130,9 @@ fn resolve_repository(namespace: &str, repository: &str, directory: &str) -> (St
         .unwrap_or_else(|| fail("invalid directory owner"));
     let shard = candid_principal_field(&response, "shard")
         .unwrap_or_else(|| fail("invalid directory shard"));
-    (owner, shard)
+    let storage_id = candid_text_field(&response, "storage_id")
+        .unwrap_or_else(|| fail("invalid directory storage ID"));
+    (owner, shard, storage_id)
 }
 
 fn repository_path(root: &Path, principal: &str, repository: &str) -> Result<PathBuf, String> {
@@ -225,11 +239,11 @@ fn main() {
                 .flatten()
         });
     let direct_canister = env::var("INFINIGIT_CANISTER").ok();
-    let (owner, canister) = if let Some(directory) = directory.as_deref() {
-        let (owner, shard) = resolve_repository(namespace, repository, directory);
-        (owner, Some(shard))
+    let (owner, canister, storage_id) = if let Some(directory) = directory.as_deref() {
+        let (owner, shard, storage_id) = resolve_repository(namespace, repository, directory);
+        (owner, Some(shard), storage_id)
     } else {
-        (namespace.to_owned(), direct_canister)
+        (namespace.to_owned(), direct_canister, repository.to_owned())
     };
     let caller = env::var("INFINIGIT_PRINCIPAL").ok();
     let project_root =
@@ -238,14 +252,14 @@ fn main() {
         .map(PathBuf::from)
         .or_else(|| git_config("infinigit.data-dir").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from(".infinigit/repositories"));
-    let repo = repository_path(&root, &owner, repository).unwrap_or_else(|e| fail(e));
+    let repo = repository_path(&root, namespace, repository).unwrap_or_else(|e| fail(e));
     if let Some(canister) = canister.as_deref() {
         eprintln!(
             "infinigit: synchronizing {} via canister {}",
             repo.display(),
             canister
         );
-        sync_from_canister(canister, &owner, repository, &repo, project_root.as_deref());
+        sync_from_canister(canister, &owner, &storage_id, &repo, project_root.as_deref());
     }
     if !repo.join("HEAD").is_file() {
         fail(format!("repository does not exist: {}", repo.display()));
@@ -293,7 +307,7 @@ fn main() {
                         sync_to_canister(
                             canister,
                             &owner,
-                            repository,
+                            &storage_id,
                             &repo,
                             project_root.as_deref(),
                         );
@@ -330,7 +344,7 @@ mod tests {
     #[test]
     fn parses_directory_principals_and_rejects_missing_fields() {
         let response =
-            "owner = principal \"aaaaa-aa\"; shard = principal \"rrkah-fqaaa-aaaaa-aaaaq-cai\"";
+            "owner = principal \"aaaaa-aa\"; shard = principal \"rrkah-fqaaa-aaaaa-aaaaq-cai\"; storage_id = \"igit-r-7\"";
         assert_eq!(
             candid_principal_field(response, "owner").as_deref(),
             Some("aaaaa-aa")
@@ -340,6 +354,8 @@ mod tests {
             Some("rrkah-fqaaa-aaaaa-aaaaq-cai")
         );
         assert_eq!(candid_principal_field(response, "missing"), None);
+        assert_eq!(candid_text_field(response, "storage_id").as_deref(), Some("igit-r-7"));
+        assert_eq!(candid_text_field("storage_id = \"bad/value\"", "storage_id"), None);
     }
 
     #[test]
