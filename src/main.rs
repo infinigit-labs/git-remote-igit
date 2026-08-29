@@ -91,7 +91,11 @@ fn candid_text_field(response: &str, field: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn resolve_repository(namespace: &str, repository: &str, directory: &str) -> (String, String, String) {
+fn resolve_repository(
+    namespace: &str,
+    repository: &str,
+    directory: &str,
+) -> (String, String, String) {
     let icp = configured("INFINIGIT_ICP_BIN", "infinigit.icp-bin").unwrap_or_else(|| "icp".into());
     let argument = format!("(\"{namespace}\", \"{repository}\")");
     let mut command = Command::new(icp);
@@ -259,7 +263,13 @@ fn main() {
             repo.display(),
             canister
         );
-        sync_from_canister(canister, &owner, &storage_id, &repo, project_root.as_deref());
+        sync_from_canister(
+            canister,
+            &owner,
+            &storage_id,
+            &repo,
+            project_root.as_deref(),
+        );
     }
     if !repo.join("HEAD").is_file() {
         fail(format!("repository does not exist: {}", repo.display()));
@@ -343,8 +353,7 @@ mod tests {
 
     #[test]
     fn parses_directory_principals_and_rejects_missing_fields() {
-        let response =
-            "owner = principal \"aaaaa-aa\"; shard = principal \"rrkah-fqaaa-aaaaa-aaaaq-cai\"; storage_id = \"igit-r-7\"";
+        let response = "owner = principal \"aaaaa-aa\"; shard = principal \"rrkah-fqaaa-aaaaa-aaaaq-cai\"; storage_id = \"igit-r-7\"";
         assert_eq!(
             candid_principal_field(response, "owner").as_deref(),
             Some("aaaaa-aa")
@@ -354,8 +363,14 @@ mod tests {
             Some("rrkah-fqaaa-aaaaa-aaaaq-cai")
         );
         assert_eq!(candid_principal_field(response, "missing"), None);
-        assert_eq!(candid_text_field(response, "storage_id").as_deref(), Some("igit-r-7"));
-        assert_eq!(candid_text_field("storage_id = \"bad/value\"", "storage_id"), None);
+        assert_eq!(
+            candid_text_field(response, "storage_id").as_deref(),
+            Some("igit-r-7")
+        );
+        assert_eq!(
+            candid_text_field("storage_id = \"bad/value\"", "storage_id"),
+            None
+        );
     }
 
     #[test]
