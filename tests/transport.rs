@@ -20,6 +20,11 @@ fn git(cwd: &Path, data: &Path, args: &[&str]) -> Output {
         .env("PATH", path)
         .env("INFINIGIT_DATA_DIR", data)
         .env("INFINIGIT_PRINCIPAL", PRINCIPAL)
+        // This test process explicitly trusts the installed InfiniGit helper;
+        // Git otherwise blocks custom protocols in recursive submodule clones.
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "protocol.igit.allow")
+        .env("GIT_CONFIG_VALUE_0", "always")
         .output()
         .unwrap();
     assert!(
@@ -51,12 +56,51 @@ fn standard_clone_push_fetch_pull_branch_tag_force_and_delete_work() {
         &["init", "--bare", bare.to_str().unwrap()],
     );
 
+    let library_bare = data.join(PRINCIPAL).join("library.git");
+    git(
+        temp.path(),
+        &data,
+        &["init", "--bare", library_bare.to_str().unwrap()],
+    );
+    let library_source = temp.path().join("library-source");
+    fs::create_dir(&library_source).unwrap();
+    git(&library_source, &data, &["init", "-b", "main"]);
+    configure(&library_source, &data);
+    fs::write(library_source.join("library.txt"), "nested repository\n").unwrap();
+    git(&library_source, &data, &["add", "."]);
+    git(&library_source, &data, &["commit", "-m", "library"]);
+    git(
+        &library_source,
+        &data,
+        &["remote", "add", "origin", "igit://aaaaa-aa/library"],
+    );
+    git(&library_source, &data, &["push", "-u", "origin", "main"]);
+
     let source = temp.path().join("source");
     fs::create_dir(&source).unwrap();
     git(&source, &data, &["init", "-b", "main"]);
     configure(&source, &data);
     fs::write(source.join("README.md"), "one\n").unwrap();
+    git(
+        &source,
+        &data,
+        &[
+            "-c",
+            "protocol.igit.allow=always",
+            "submodule",
+            "add",
+            "-b",
+            "main",
+            "igit://aaaaa-aa/library",
+            "vendor/library",
+        ],
+    );
     git(&source, &data, &["add", "."]);
+    let submodule_commit =
+        String::from_utf8(git(&library_source, &data, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
     git(&source, &data, &["commit", "-m", "first"]);
     git(
         &source,
@@ -71,6 +115,9 @@ fn standard_clone_push_fetch_pull_branch_tag_force_and_delete_work() {
         &data,
         &[
             "clone",
+            "-c",
+            "protocol.igit.allow=always",
+            "--recurse-submodules",
             "-b",
             "main",
             "igit://aaaaa-aa/demo",
@@ -81,6 +128,15 @@ fn standard_clone_push_fetch_pull_branch_tag_force_and_delete_work() {
     assert_eq!(
         fs::read_to_string(clone.join("README.md")).unwrap(),
         "one\n"
+    );
+    let submodule = git(&clone, &data, &["ls-tree", "HEAD", "vendor/library"]);
+    assert_eq!(
+        String::from_utf8(submodule.stdout).unwrap().trim(),
+        format!("160000 commit {submodule_commit}\tvendor/library")
+    );
+    assert_eq!(
+        fs::read_to_string(clone.join("vendor/library/library.txt")).unwrap(),
+        "nested repository\n"
     );
 
     git(&source, &data, &["checkout", "-b", "feature"]);
