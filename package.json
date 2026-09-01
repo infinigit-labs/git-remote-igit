@@ -1,0 +1,18 @@
+{
+  "name": "git-remote-igit",
+  "version": "0.1.0",
+  "description": "Git remote helper for the native igit:// InfiniGit transport",
+  "license": "Apache-2.0",
+  "repository": "github:mclovin-clawbot/git-remote-igit",
+  "homepage": "https://infinigit.com",
+  "os": ["darwin", "linux", "win32"],
+  "cpu": ["x64", "arm64"],
+  "bin": { "git-remote-igit": "npm/bin/git-remote-igit.js" },
+  "files": ["npm/bin", "npm/lib"],
+  "scripts": {
+    "postinstall": "node npm/lib/install.js",
+    "test:npm": "node --test npm/test/*.test.js"
+  },
+  "engines": { "node": ">=18" },
+  "publishConfig": { "access": "public", "provenance": true }
+}

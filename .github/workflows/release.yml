@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify tag matches package versions
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          test "$version" = "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          test "$version" = "$(node -p "require('./package.json').version")"
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --all-targets --locked
+      - run: cargo package --locked
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - run: npm run test:npm
+
+  binaries:
+    needs: verify
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Archive binary
+        shell: bash
+        run: |
+          mkdir dist
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "${{ runner.os }}" == Windows ]]; then
+            archive="$GITHUB_WORKSPACE/dist/git-remote-igit-v${version}-${{ matrix.target }}.zip"
+            cd "target/${{ matrix.target }}/release"
+            7z a "$archive" git-remote-igit.exe
+          else
+            tar -C "target/${{ matrix.target }}/release" -czf "dist/git-remote-igit-v${version}-${{ matrix.target }}.tar.gz" git-remote-igit
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  github-release:
+    needs: binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+      - run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  crates-io:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  npm:
+    needs: [verify, github-release]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Git remote helper for the native igit:// InfiniGit transport"
+repository = "https://github.com/mclovin-clawbot/git-remote-igit"
+homepage = "https://infinigit.com"
+readme = "README.md"
+keywords = ["git", "remote-helper", "icp", "internet-computer"]
+categories = ["command-line-utilities", "development-tools"]
+publish = ["crates-io"]
 
 [[bin]]
 name = "git-remote-igit"
