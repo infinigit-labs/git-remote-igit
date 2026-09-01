@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -250,7 +252,8 @@ fn username_clone_resolves_and_materializes_without_a_project_manifest() {
     assert!(initialized.status.success());
 
     let mock_icp = temp.path().join("icp");
-    fs::write(&mock_icp, "#!/usr/bin/env bash\nset -e\n[[ \"$*\" == *'--network http://127.0.0.1:4943'* ]]\n[[ \"$*\" == *'--root-key fetch'* ]]\n[[ \"$*\" == *'--identity infinigit-browser'* ]]\nprintf '%s\\n' 'variant { ok = record { owner = principal \"aaaaa-aa\"; shard = principal \"rrkah-fqaaa-aaaaa-aaaaq-cai\"; storage_id = \"igit-r-1\"; visibility = variant { Public } } }'\n").unwrap();
+    let icp_log = temp.path().join("icp.log");
+    fs::write(&mock_icp, "#!/usr/bin/env bash\nset -e\nprintf '%s\\n' \"$*\" >\"$INFINIGIT_TEST_ICP_LOG\"\nprintf '%s\\n' 'variant { ok = record { owner = principal \"aaaaa-aa\"; shard = principal \"rrkah-fqaaa-aaaaa-aaaaq-cai\"; storage_id = \"igit-r-1\"; visibility = variant { Public } } }'\n").unwrap();
     let mock_pack = temp.path().join("infinigit-pack");
     fs::write(&mock_pack, "#!/usr/bin/env bash\nset -e\ntest \"$1\" = materialize\ntest \"$4\" = igit-r-1\ntest \"$PWD\" = \"$INFINIGIT_EXPECTED_WORKING_DIRECTORY\"\ntest -z \"${INFINIGIT_PROJECT_ROOT:-}\"\ntest \"$INFINIGIT_NETWORK\" = 'http://127.0.0.1:4943'\ntest \"$INFINIGIT_ROOT_KEY\" = fetch\ntest \"$INFINIGIT_IDENTITY\" = infinigit-browser\nmkdir -p \"$(dirname \"$5\")\"\ncp -R \"$INFINIGIT_TEST_SOURCE\" \"$5\"\n").unwrap();
     fs::set_permissions(&mock_icp, fs::Permissions::from_mode(0o755)).unwrap();
@@ -277,6 +280,7 @@ fn username_clone_resolves_and_materializes_without_a_project_manifest() {
         .env("INFINIGIT_IDENTITY", "infinigit-browser")
         .env("INFINIGIT_EXPECTED_WORKING_DIRECTORY", &outside)
         .env("INFINIGIT_ICP_BIN", &mock_icp)
+        .env("INFINIGIT_TEST_ICP_LOG", &icp_log)
         .env("INFINIGIT_PACK_BIN", &mock_pack)
         .env("INFINIGIT_DATA_DIR", &cache)
         .env("INFINIGIT_TEST_SOURCE", &source)
@@ -289,4 +293,8 @@ fn username_clone_resolves_and_materializes_without_a_project_manifest() {
     );
     assert!(clone.join(".git").is_dir());
     assert!(cache.join("alice-dev/demo.git/HEAD").is_file());
+    let icp_call = fs::read_to_string(icp_log).unwrap();
+    assert!(icp_call.contains("--network http://127.0.0.1:4943"));
+    assert!(icp_call.contains("--root-key fetch"));
+    assert!(icp_call.contains("--identity infinigit-browser"));
 }
