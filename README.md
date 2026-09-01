@@ -18,5 +18,5 @@ Tags named `v<version>` publish the crate and npm package and attach native
 Linux, macOS, and Windows binaries to a GitHub Release. Keep the versions in
 `Cargo.toml` and `package.json` identical before tagging. The `release`
 environment needs a `CARGO_REGISTRY_TOKEN` secret. npm trusted publishing should
-authorize `mclovin-clawbot/git-remote-igit` and `.github/workflows/release.yml`;
+authorize `infinigit-labs/git-remote-igit` and `.github/workflows/release.yml`;
 an `NPM_TOKEN` secret can bootstrap the first publication.

@@ -12,7 +12,7 @@ const binary = 'git-remote-igit';
 const target = targetFor();
 const extension = process.platform === 'win32' ? '.zip' : '.tar.gz';
 const asset = `${pkg.name}-v${pkg.version}-${target}${extension}`;
-const url = `https://github.com/mclovin-clawbot/${pkg.name}/releases/download/v${pkg.version}/${asset}`;
+const url = `https://github.com/infinigit-labs/${pkg.name}/releases/download/v${pkg.version}/${asset}`;
 const vendor = path.join(__dirname, '..', 'vendor');
 
 function request(source, redirects = 5) {
