@@ -245,6 +245,9 @@ fn username_clone_resolves_and_materializes_without_a_project_manifest() {
     let outside = temp.path().join("outside");
     let clone = outside.join("demo");
     fs::create_dir(&outside).unwrap();
+    // macOS exposes temporary directories through /var, while a child shell's
+    // physical working directory resolves that symlink to /private/var.
+    let canonical_outside = outside.canonicalize().unwrap();
     let initialized = Command::new("git")
         .args(["init", "--bare", source.to_str().unwrap()])
         .output()
@@ -278,7 +281,7 @@ fn username_clone_resolves_and_materializes_without_a_project_manifest() {
         .env("INFINIGIT_NETWORK", "http://127.0.0.1:4943")
         .env("INFINIGIT_ROOT_KEY", "fetch")
         .env("INFINIGIT_IDENTITY", "infinigit-browser")
-        .env("INFINIGIT_EXPECTED_WORKING_DIRECTORY", &outside)
+        .env("INFINIGIT_EXPECTED_WORKING_DIRECTORY", &canonical_outside)
         .env("INFINIGIT_ICP_BIN", &mock_icp)
         .env("INFINIGIT_TEST_ICP_LOG", &icp_log)
         .env("INFINIGIT_PACK_BIN", &mock_pack)
