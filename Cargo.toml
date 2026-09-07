@@ -1,6 +1,6 @@
 [package]
 name = "git-remote-igit"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "Apache-2.0"
 description = "Git remote helper for the native igit:// InfiniGit transport"
