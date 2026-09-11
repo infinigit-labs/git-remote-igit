@@ -1,6 +1,6 @@
 {
   "name": "git-remote-igit",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Git remote helper for the native igit:// InfiniGit transport",
   "license": "Apache-2.0",
   "repository": "github:infinigit-labs/git-remote-igit",
