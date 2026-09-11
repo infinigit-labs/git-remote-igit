@@ -448,9 +448,10 @@ dependencies = [
 
 [[package]]
 name = "git-remote-igit"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "candid_parser",
+ "dirs-next",
  "rpassword",
  "serde_json",
  "sha2",

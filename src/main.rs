@@ -200,6 +200,17 @@ fn repository_path(root: &Path, principal: &str, repository: &str) -> Result<Pat
     Ok(root.join(principal).join(format!("{repository}.git")))
 }
 
+fn default_repository_root(production: bool, cache_dir: Option<PathBuf>) -> PathBuf {
+    if production {
+        cache_dir
+            .unwrap_or_else(env::temp_dir)
+            .join("infinigit")
+            .join("repositories")
+    } else {
+        PathBuf::from(".infinigit/repositories")
+    }
+}
+
 fn pack_bridge(production: bool) -> PathBuf {
     env::var_os("INFINIGIT_PACK_BIN")
         .map(PathBuf::from)
@@ -357,7 +368,7 @@ fn main() {
                 .flatten()
                 .map(PathBuf::from)
         })
-        .unwrap_or_else(|| PathBuf::from(".infinigit/repositories"));
+        .unwrap_or_else(|| default_repository_root(production, dirs_next::cache_dir()));
     let repo = repository_path(&root, namespace, repository).unwrap_or_else(|e| fail(e));
     if let Some(canister) = canister.as_deref() {
         eprintln!(
@@ -454,6 +465,19 @@ mod tests {
         assert!(password_backed_identity_json(&identities, Some("secure")));
         assert!(!password_backed_identity_json(&identities, Some("plain")));
         assert!(!password_backed_identity_json(&identities, Some("missing")));
+    }
+
+    #[test]
+    fn production_cache_is_outside_the_working_tree() {
+        let cache = PathBuf::from("/user-cache");
+        assert_eq!(
+            default_repository_root(true, Some(cache.clone())),
+            cache.join("infinigit/repositories")
+        );
+        assert_eq!(
+            default_repository_root(false, Some(cache)),
+            PathBuf::from(".infinigit/repositories")
+        );
     }
 
     #[test]
