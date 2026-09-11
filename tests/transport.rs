@@ -301,3 +301,65 @@ fn username_clone_resolves_and_materializes_without_a_project_manifest() {
     assert!(icp_call.contains("--root-key fetch"));
     assert!(icp_call.contains("--identity infinigit-browser"));
 }
+
+#[test]
+fn production_clone_ignores_stale_local_configuration() {
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("source.git");
+    let clone = temp.path().join("clone");
+    let initialized = Command::new("git")
+        .args(["init", "--bare", source.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(initialized.status.success());
+
+    let mock_icp = temp.path().join("icp");
+    let mock_pack = temp.path().join("infinigit-pack");
+    fs::write(
+        &mock_icp,
+        "#!/usr/bin/env bash\nset -e\ntest \"$3\" = 'vc3gg-2qaaa-aaaae-qklda-cai'\ntest \"${*: -2:1}\" = '--network'\ntest \"${*: -1}\" = 'ic'\nprintf '%s\\n' 'variant { ok = record { owner = principal \"aaaaa-aa\"; shard = principal \"rrkah-fqaaa-aaaaa-aaaaq-cai\"; storage_id = \"igit-production-1\"; visibility = variant { Public } } }'\n",
+    )
+    .unwrap();
+    fs::write(
+        &mock_pack,
+        "#!/usr/bin/env bash\nset -e\ntest \"$1\" = materialize\ntest \"$4\" = igit-production-1\ntest \"$INFINIGIT_NETWORK\" = ic\ntest -z \"${INFINIGIT_ROOT_KEY:-}\"\nmkdir -p \"$(dirname \"$5\")\"\ncp -R \"$INFINIGIT_TEST_SOURCE\" \"$5\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&mock_icp, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&mock_pack, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let stale = temp.path().join("stale.gitconfig");
+    fs::write(
+        &stale,
+        "[infinigit]\n\thost = localhost\n\tdirectory-canister = local-directory\n\tnetwork = http://127.0.0.1:4943\n\troot-key = fetch\n\tpack-bin = /missing/local/infinigit-pack\n",
+    )
+    .unwrap();
+    let helper = env!("CARGO_BIN_EXE_git-remote-igit");
+    let path = format!(
+        "{}:{}",
+        Path::new(helper).parent().unwrap().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new("git")
+        .args([
+            "clone",
+            "igit://infinigit.com/infinigit/first-repo-ever",
+            clone.to_str().unwrap(),
+        ])
+        .current_dir(temp.path())
+        .env("GIT_CONFIG_GLOBAL", stale)
+        .env("PATH", path)
+        .env("INFINIGIT_ICP_BIN", mock_icp)
+        .env("INFINIGIT_PACK_BIN", mock_pack)
+        .env("INFINIGIT_ROOT_KEY", "fetch")
+        .env("INFINIGIT_DATA_DIR", temp.path().join("cache"))
+        .env("INFINIGIT_TEST_SOURCE", source)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(clone.join(".git").is_dir());
+}

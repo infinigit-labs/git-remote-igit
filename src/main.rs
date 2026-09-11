@@ -11,6 +11,10 @@ use std::io::{self, BufRead, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
+const PRODUCTION_HOST: &str = "infinigit.com";
+const PRODUCTION_DIRECTORY: &str = "vc3gg-2qaaa-aaaae-qklda-cai";
+const PRODUCTION_NETWORK: &str = "ic";
+
 fn fail(message: impl AsRef<str>) -> ! {
     eprintln!("infinigit: {}", message.as_ref());
     std::process::exit(1)
@@ -64,6 +68,7 @@ fn configured(env_key: &str, git_key: &str) -> Option<String> {
 
 fn validate_host(host: Option<&str>, configured_host: Option<&str>) -> Result<(), String> {
     match (host, configured_host) {
+        (Some(PRODUCTION_HOST), _) => Ok(()),
         (Some(host), Some(configured)) if host != configured => {
             Err(format!("unknown InfiniGit host: {host}"))
         }
@@ -95,6 +100,7 @@ fn resolve_repository(
     namespace: &str,
     repository: &str,
     directory: &str,
+    production: bool,
 ) -> (String, String, String) {
     let icp = configured("INFINIGIT_ICP_BIN", "infinigit.icp-bin").unwrap_or_else(|| "icp".into());
     let argument = format!("(\"{namespace}\", \"{repository}\")");
@@ -109,7 +115,9 @@ fn resolve_repository(
     if let Some(identity) = configured("INFINIGIT_IDENTITY", "infinigit.identity") {
         command.args(["--identity", &identity]);
     }
-    if let Some(network) = configured("INFINIGIT_NETWORK", "infinigit.network") {
+    if production {
+        command.args(["--network", PRODUCTION_NETWORK]);
+    } else if let Some(network) = configured("INFINIGIT_NETWORK", "infinigit.network") {
         command.args(["--network", &network]);
         if let Some(root_key) = configured("INFINIGIT_ROOT_KEY", "infinigit.root-key") {
             command.args(["--root-key", &root_key]);
@@ -149,10 +157,15 @@ fn repository_path(root: &Path, principal: &str, repository: &str) -> Result<Pat
     Ok(root.join(principal).join(format!("{repository}.git")))
 }
 
-fn pack_bridge() -> PathBuf {
+fn pack_bridge(production: bool) -> PathBuf {
     env::var_os("INFINIGIT_PACK_BIN")
         .map(PathBuf::from)
-        .or_else(|| git_config("infinigit.pack-bin").map(PathBuf::from))
+        .or_else(|| {
+            (!production)
+                .then(|| git_config("infinigit.pack-bin"))
+                .flatten()
+                .map(PathBuf::from)
+        })
         .unwrap_or_else(|| {
             env::current_exe()
                 .unwrap_or_else(|e| fail(e.to_string()))
@@ -167,8 +180,9 @@ fn run_pack(
     repository: &str,
     repo: &Path,
     project_root: Option<&Path>,
+    production: bool,
 ) -> bool {
-    let mut command = Command::new(pack_bridge());
+    let mut command = Command::new(pack_bridge(production));
     command
         .args([action, canister, owner, repository])
         .arg(repo);
@@ -180,11 +194,14 @@ fn run_pack(
     if let Some(icp) = configured("INFINIGIT_ICP_BIN", "infinigit.icp-bin") {
         command.env("INFINIGIT_ICP_BIN", icp);
     }
-    if let Some(network) = configured("INFINIGIT_NETWORK", "infinigit.network") {
+    if production {
+        command.env("INFINIGIT_NETWORK", PRODUCTION_NETWORK);
+        command.env_remove("INFINIGIT_ROOT_KEY");
+    } else if let Some(network) = configured("INFINIGIT_NETWORK", "infinigit.network") {
         command.env("INFINIGIT_NETWORK", network);
-    }
-    if let Some(root_key) = configured("INFINIGIT_ROOT_KEY", "infinigit.root-key") {
-        command.env("INFINIGIT_ROOT_KEY", root_key);
+        if let Some(root_key) = configured("INFINIGIT_ROOT_KEY", "infinigit.root-key") {
+            command.env("INFINIGIT_ROOT_KEY", root_key);
+        }
     }
     if let Some(identity) = configured("INFINIGIT_IDENTITY", "infinigit.identity") {
         command.env("INFINIGIT_IDENTITY", identity);
@@ -201,6 +218,7 @@ fn sync_from_canister(
     repository: &str,
     repo: &Path,
     project_root: Option<&Path>,
+    production: bool,
 ) {
     if !run_pack(
         "materialize",
@@ -209,6 +227,7 @@ fn sync_from_canister(
         repository,
         repo,
         project_root,
+        production,
     ) {
         fail("repository not found")
     }
@@ -220,8 +239,17 @@ fn sync_to_canister(
     repository: &str,
     repo: &Path,
     project_root: Option<&Path>,
+    production: bool,
 ) {
-    if !run_pack("upload", canister, owner, repository, repo, project_root) {
+    if !run_pack(
+        "upload",
+        canister,
+        owner,
+        repository,
+        repo,
+        project_root,
+        production,
+    ) {
         fail("canister rejected push")
     }
 }
@@ -232,29 +260,42 @@ fn main() {
         fail("usage: git-remote-igit <remote-name> <igit-url>");
     }
     let (host, namespace, repository) = parse_remote(&args[2]).unwrap_or_else(|e| fail(e));
+    let production = host == Some(PRODUCTION_HOST);
     let configured_host = git_config("infinigit.host");
     validate_host(host, configured_host.as_deref()).unwrap_or_else(|e| fail(e));
     let direct_data = env::var_os("INFINIGIT_DATA_DIR").is_some();
     let directory = env::var("INFINIGIT_DIRECTORY_CANISTER_ID")
         .ok()
         .or_else(|| {
-            (!direct_data)
-                .then(|| git_config("infinigit.directory-canister"))
-                .flatten()
+            production
+                .then(|| PRODUCTION_DIRECTORY.to_owned())
+                .or_else(|| {
+                    (!direct_data)
+                        .then(|| git_config("infinigit.directory-canister"))
+                        .flatten()
+                })
         });
     let direct_canister = env::var("INFINIGIT_CANISTER").ok();
     let (owner, canister, storage_id) = if let Some(directory) = directory.as_deref() {
-        let (owner, shard, storage_id) = resolve_repository(namespace, repository, directory);
+        let (owner, shard, storage_id) =
+            resolve_repository(namespace, repository, directory, production);
         (owner, Some(shard), storage_id)
     } else {
         (namespace.to_owned(), direct_canister, repository.to_owned())
     };
     let caller = env::var("INFINIGIT_PRINCIPAL").ok();
-    let project_root =
-        configured("INFINIGIT_PROJECT_ROOT", "infinigit.project-root").map(PathBuf::from);
+    let project_root = (!production)
+        .then(|| configured("INFINIGIT_PROJECT_ROOT", "infinigit.project-root"))
+        .flatten()
+        .map(PathBuf::from);
     let root = env::var_os("INFINIGIT_DATA_DIR")
         .map(PathBuf::from)
-        .or_else(|| git_config("infinigit.data-dir").map(PathBuf::from))
+        .or_else(|| {
+            (!production)
+                .then(|| git_config("infinigit.data-dir"))
+                .flatten()
+                .map(PathBuf::from)
+        })
         .unwrap_or_else(|| PathBuf::from(".infinigit/repositories"));
     let repo = repository_path(&root, namespace, repository).unwrap_or_else(|e| fail(e));
     if let Some(canister) = canister.as_deref() {
@@ -269,6 +310,7 @@ fn main() {
             &storage_id,
             &repo,
             project_root.as_deref(),
+            production,
         );
     }
     if !repo.join("HEAD").is_file() {
@@ -320,6 +362,7 @@ fn main() {
                             &storage_id,
                             &repo,
                             project_root.as_deref(),
+                            production,
                         );
                     }
                 }
@@ -376,6 +419,7 @@ mod tests {
     #[test]
     fn host_validation_accepts_configured_and_legacy_urls_but_rejects_other_installations() {
         assert!(validate_host(Some("localhost"), Some("localhost")).is_ok());
+        assert!(validate_host(Some(PRODUCTION_HOST), Some("localhost")).is_ok());
         assert!(validate_host(None, Some("localhost")).is_ok());
         assert!(validate_host(Some("git.example"), None).is_ok());
         assert_eq!(

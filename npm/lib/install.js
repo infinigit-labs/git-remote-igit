@@ -8,7 +8,7 @@ const { spawnSync } = require('node:child_process');
 const pkg = require('../../package.json');
 const { targetFor } = require('./platform');
 
-const binary = 'git-remote-igit';
+const binaries = ['git-remote-igit', 'infinigit-pack'];
 const target = targetFor();
 const extension = process.platform === 'win32' ? '.zip' : '.tar.gz';
 const asset = `${pkg.name}-v${pkg.version}-${target}${extension}`;
@@ -33,7 +33,9 @@ async function install() {
   const result = spawnSync('tar', ['-xf', archive, '-C', vendor], { stdio: 'inherit' });
   fs.rmSync(archive, { force: true });
   if (result.status !== 0) throw new Error('Could not extract downloaded archive');
-  if (process.platform !== 'win32') fs.chmodSync(path.join(vendor, binary), 0o755);
+  if (process.platform !== 'win32') {
+    for (const binary of binaries) fs.chmodSync(path.join(vendor, binary), 0o755);
+  }
 }
 
 install().catch(error => { console.error(`${pkg.name}: ${error.message}`); process.exitCode = 1; });

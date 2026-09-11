@@ -10,7 +10,11 @@ git clone igit://infinigit.com/username/repository
 
 Git discovers the executable by its `git-remote-igit` name. The helper resolves
 human-readable repository coordinates through the InfiniGit directory and
-uses the external `infinigit-pack` bridge to synchronize canister packfiles.
+uses the bundled `infinigit-pack` bridge to synchronize canister packfiles.
+`infinigit.com` automatically selects the ICP mainnet and production directory;
+no environment variables or Git configuration are required for public clones.
+Explicit configuration remains available for local development and other
+InfiniGit installations.
 
 ## Releases
 

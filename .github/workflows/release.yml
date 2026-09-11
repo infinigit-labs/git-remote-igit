@@ -57,9 +57,9 @@ jobs:
           if [[ "${{ runner.os }}" == Windows ]]; then
             archive="$GITHUB_WORKSPACE/dist/git-remote-igit-v${version}-${{ matrix.target }}.zip"
             cd "target/${{ matrix.target }}/release"
-            7z a "$archive" git-remote-igit.exe
+            7z a "$archive" git-remote-igit.exe infinigit-pack.exe
           else
-            tar -C "target/${{ matrix.target }}/release" -czf "dist/git-remote-igit-v${version}-${{ matrix.target }}.tar.gz" git-remote-igit
+            tar -C "target/${{ matrix.target }}/release" -czf "dist/git-remote-igit-v${version}-${{ matrix.target }}.tar.gz" git-remote-igit infinigit-pack
           fi
       - uses: actions/upload-artifact@v7
         with:

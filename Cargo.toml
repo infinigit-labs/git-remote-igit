@@ -1,6 +1,6 @@
 [package]
 name = "git-remote-igit"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "Apache-2.0"
 description = "Git remote helper for the native igit:// InfiniGit transport"
@@ -11,9 +11,18 @@ keywords = ["git", "remote-helper", "icp", "internet-computer"]
 categories = ["command-line-utilities", "development-tools"]
 publish = ["crates-io"]
 
+[dependencies]
+candid_parser = "0.4.1"
+serde_json = "1"
+sha2 = "0.10"
+
 [[bin]]
 name = "git-remote-igit"
 path = "src/main.rs"
+
+[[bin]]
+name = "infinigit-pack"
+path = "src/bin/infinigit-pack.rs"
 
 [dev-dependencies]
 tempfile = "3.13"
