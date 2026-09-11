@@ -58,6 +58,9 @@ fn icp_json(canister: &str, method: &str, argument: &str) -> Value {
     if let Some(identity) = env::var_os("INFINIGIT_IDENTITY") {
         command.arg("--identity").arg(identity);
     }
+    if let Some(path) = env::var_os("INFINIGIT_IDENTITY_PASSWORD_FILE") {
+        command.arg("--identity-password-file").arg(path);
+    }
     if let Some(network) = env::var_os("INFINIGIT_NETWORK") {
         command.arg("--network").arg(network);
         if let Some(root_key) = env::var_os("INFINIGIT_ROOT_KEY") {

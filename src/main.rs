@@ -10,6 +10,7 @@ use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use tempfile::NamedTempFile;
 
 const PRODUCTION_HOST: &str = "infinigit.com";
 const PRODUCTION_DIRECTORY: &str = "vc3gg-2qaaa-aaaae-qklda-cai";
@@ -66,6 +67,42 @@ fn configured(env_key: &str, git_key: &str) -> Option<String> {
     env::var(env_key).ok().or_else(|| git_config(git_key))
 }
 
+fn password_backed_identity(icp: &str, selected: Option<&str>) -> bool {
+    let output = match Command::new(icp).args(["identity", "list", "--json"]).output() {
+        Ok(output) if output.status.success() => output,
+        _ => return false,
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    password_backed_identity_json(&value, selected)
+}
+
+fn password_backed_identity_json(value: &serde_json::Value, selected: Option<&str>) -> bool {
+    let name = selected.or_else(|| value.get("default_identity")?.as_str());
+    value
+        .get("identities")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|identities| identities.iter().find(|entry| entry.get("name").and_then(serde_json::Value::as_str) == name))
+        .and_then(|entry| entry.get("format"))
+        .and_then(serde_json::Value::as_str)
+        == Some("password")
+}
+
+fn unlock_identity(icp: &str, identity: Option<&str>) -> Option<NamedTempFile> {
+    if !password_backed_identity(icp, identity) {
+        return None;
+    }
+    let password = rpassword::prompt_password("Enter identity password: ")
+        .unwrap_or_else(|error| fail(format!("failed to read identity password: {error}")));
+    let mut file = NamedTempFile::new()
+        .unwrap_or_else(|error| fail(format!("cannot create identity password file: {error}")));
+    writeln!(file, "{password}")
+        .unwrap_or_else(|error| fail(format!("cannot write identity password file: {error}")));
+    Some(file)
+}
+
 fn validate_host(host: Option<&str>, configured_host: Option<&str>) -> Result<(), String> {
     match (host, configured_host) {
         (Some(PRODUCTION_HOST), _) => Ok(()),
@@ -101,6 +138,7 @@ fn resolve_repository(
     repository: &str,
     directory: &str,
     production: bool,
+    password_file: Option<&Path>,
 ) -> (String, String, String) {
     let icp = configured("INFINIGIT_ICP_BIN", "infinigit.icp-bin").unwrap_or_else(|| "icp".into());
     let argument = format!("(\"{namespace}\", \"{repository}\")");
@@ -114,6 +152,9 @@ fn resolve_repository(
     ]);
     if let Some(identity) = configured("INFINIGIT_IDENTITY", "infinigit.identity") {
         command.args(["--identity", &identity]);
+    }
+    if let Some(path) = password_file {
+        command.arg("--identity-password-file").arg(path);
     }
     if production {
         command.args(["--network", PRODUCTION_NETWORK]);
@@ -183,6 +224,7 @@ fn run_pack(
     repo: &Path,
     project_root: Option<&Path>,
     production: bool,
+    password_file: Option<&Path>,
 ) -> bool {
     let mut command = Command::new(pack_bridge(production));
     command
@@ -208,6 +250,9 @@ fn run_pack(
     if let Some(identity) = configured("INFINIGIT_IDENTITY", "infinigit.identity") {
         command.env("INFINIGIT_IDENTITY", identity);
     }
+    if let Some(path) = password_file {
+        command.env("INFINIGIT_IDENTITY_PASSWORD_FILE", path);
+    }
     command
         .status()
         .unwrap_or_else(|e| fail(format!("cannot start pack bridge: {e}")))
@@ -221,6 +266,7 @@ fn sync_from_canister(
     repo: &Path,
     project_root: Option<&Path>,
     production: bool,
+    password_file: Option<&Path>,
 ) {
     if !run_pack(
         "materialize",
@@ -230,6 +276,7 @@ fn sync_from_canister(
         repo,
         project_root,
         production,
+        password_file,
     ) {
         fail("repository not found")
     }
@@ -242,6 +289,7 @@ fn sync_to_canister(
     repo: &Path,
     project_root: Option<&Path>,
     production: bool,
+    password_file: Option<&Path>,
 ) {
     if !run_pack(
         "upload",
@@ -251,6 +299,7 @@ fn sync_to_canister(
         repo,
         project_root,
         production,
+        password_file,
     ) {
         fail("canister rejected push")
     }
@@ -278,9 +327,19 @@ fn main() {
                 })
         });
     let direct_canister = env::var("INFINIGIT_CANISTER").ok();
+    let icp = configured("INFINIGIT_ICP_BIN", "infinigit.icp-bin").unwrap_or_else(|| "icp".into());
+    let identity = configured("INFINIGIT_IDENTITY", "infinigit.identity");
+    let supplied_password_file = env::var_os("INFINIGIT_IDENTITY_PASSWORD_FILE").map(PathBuf::from);
+    let temporary_password_file = supplied_password_file
+        .is_none()
+        .then(|| unlock_identity(&icp, identity.as_deref()))
+        .flatten();
+    let password_file = supplied_password_file
+        .as_deref()
+        .or_else(|| temporary_password_file.as_ref().map(|file| file.path()));
     let (owner, canister, storage_id) = if let Some(directory) = directory.as_deref() {
         let (owner, shard, storage_id) =
-            resolve_repository(namespace, repository, directory, production);
+            resolve_repository(namespace, repository, directory, production, password_file);
         (owner, Some(shard), storage_id)
     } else {
         (namespace.to_owned(), direct_canister, repository.to_owned())
@@ -313,6 +372,7 @@ fn main() {
             &repo,
             project_root.as_deref(),
             production,
+            password_file,
         );
     }
     if !repo.join("HEAD").is_file() {
@@ -365,6 +425,7 @@ fn main() {
                             &repo,
                             project_root.as_deref(),
                             production,
+                            password_file,
                         );
                     }
                 }
@@ -379,6 +440,21 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_only_the_selected_password_backed_identity() {
+        let identities = serde_json::json!({
+            "default_identity": "secure",
+            "identities": [
+                { "name": "plain", "format": "plaintext" },
+                { "name": "secure", "format": "password" }
+            ]
+        });
+        assert!(password_backed_identity_json(&identities, None));
+        assert!(password_backed_identity_json(&identities, Some("secure")));
+        assert!(!password_backed_identity_json(&identities, Some("plain")));
+        assert!(!password_backed_identity_json(&identities, Some("missing")));
+    }
 
     #[test]
     fn parses_supported_urls_and_rejects_anonymous_identity() {

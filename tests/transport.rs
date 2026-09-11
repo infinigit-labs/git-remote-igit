@@ -317,18 +317,20 @@ fn production_clone_ignores_stale_local_configuration() {
     let mock_pack = temp.path().join("infinigit-pack");
     fs::write(
         &mock_icp,
-        "#!/usr/bin/env bash\nset -e\ntest \"$3\" = 'vc3gg-2qaaa-aaaae-qklda-cai'\ntest \"${*: -2:1}\" = '--network'\ntest \"${*: -1}\" = 'ic'\nprintf '%s\\n' 'interactive identity prompt' >&2\nprintf '%s\\n' 'variant { ok = record { owner = principal \"aaaaa-aa\"; shard = principal \"rrkah-fqaaa-aaaaa-aaaaq-cai\"; storage_id = \"igit-production-1\"; visibility = variant { Public } } }'\n",
+        "#!/usr/bin/env bash\nset -e\ntest \"$3\" = 'vc3gg-2qaaa-aaaae-qklda-cai'\n[[ \"$*\" == *\"--identity-password-file $INFINIGIT_TEST_PASSWORD_FILE\"* ]]\ntest \"${*: -2:1}\" = '--network'\ntest \"${*: -1}\" = 'ic'\nprintf '%s\\n' 'interactive identity prompt' >&2\nprintf '%s\\n' 'variant { ok = record { owner = principal \"aaaaa-aa\"; shard = principal \"rrkah-fqaaa-aaaaa-aaaaq-cai\"; storage_id = \"igit-production-1\"; visibility = variant { Public } } }'\n",
     )
     .unwrap();
     fs::write(
         &mock_pack,
-        "#!/usr/bin/env bash\nset -e\ntest \"$1\" = materialize\ntest \"$4\" = igit-production-1\ntest \"$INFINIGIT_NETWORK\" = ic\ntest -z \"${INFINIGIT_ROOT_KEY:-}\"\nmkdir -p \"$(dirname \"$5\")\"\ncp -R \"$INFINIGIT_TEST_SOURCE\" \"$5\"\n",
+        "#!/usr/bin/env bash\nset -e\ntest \"$1\" = materialize\ntest \"$4\" = igit-production-1\ntest \"$INFINIGIT_NETWORK\" = ic\ntest \"$INFINIGIT_IDENTITY_PASSWORD_FILE\" = \"$INFINIGIT_TEST_PASSWORD_FILE\"\ntest -z \"${INFINIGIT_ROOT_KEY:-}\"\nmkdir -p \"$(dirname \"$5\")\"\ncp -R \"$INFINIGIT_TEST_SOURCE\" \"$5\"\n",
     )
     .unwrap();
     fs::set_permissions(&mock_icp, fs::Permissions::from_mode(0o755)).unwrap();
     fs::set_permissions(&mock_pack, fs::Permissions::from_mode(0o755)).unwrap();
 
     let stale = temp.path().join("stale.gitconfig");
+    let password_file = temp.path().join("identity-password");
+    fs::write(&password_file, "secret\n").unwrap();
     fs::write(
         &stale,
         "[infinigit]\n\thost = localhost\n\tdirectory-canister = local-directory\n\tnetwork = http://127.0.0.1:4943\n\troot-key = fetch\n\tpack-bin = /missing/local/infinigit-pack\n",
@@ -354,6 +356,8 @@ fn production_clone_ignores_stale_local_configuration() {
         .env("INFINIGIT_ROOT_KEY", "fetch")
         .env("INFINIGIT_DATA_DIR", temp.path().join("cache"))
         .env("INFINIGIT_TEST_SOURCE", source)
+        .env("INFINIGIT_TEST_PASSWORD_FILE", &password_file)
+        .env("INFINIGIT_IDENTITY_PASSWORD_FILE", &password_file)
         .output()
         .unwrap();
     assert!(
