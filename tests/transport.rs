@@ -317,7 +317,7 @@ fn production_clone_ignores_stale_local_configuration() {
     let mock_pack = temp.path().join("infinigit-pack");
     fs::write(
         &mock_icp,
-        "#!/usr/bin/env bash\nset -e\ntest \"$3\" = 'vc3gg-2qaaa-aaaae-qklda-cai'\ntest \"${*: -2:1}\" = '--network'\ntest \"${*: -1}\" = 'ic'\nprintf '%s\\n' 'variant { ok = record { owner = principal \"aaaaa-aa\"; shard = principal \"rrkah-fqaaa-aaaaa-aaaaq-cai\"; storage_id = \"igit-production-1\"; visibility = variant { Public } } }'\n",
+        "#!/usr/bin/env bash\nset -e\ntest \"$3\" = 'vc3gg-2qaaa-aaaae-qklda-cai'\ntest \"${*: -2:1}\" = '--network'\ntest \"${*: -1}\" = 'ic'\nprintf '%s\\n' 'interactive identity prompt' >&2\nprintf '%s\\n' 'variant { ok = record { owner = principal \"aaaaa-aa\"; shard = principal \"rrkah-fqaaa-aaaaa-aaaaq-cai\"; storage_id = \"igit-production-1\"; visibility = variant { Public } } }'\n",
     )
     .unwrap();
     fs::write(
@@ -362,4 +362,5 @@ fn production_clone_ignores_stale_local_configuration() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(clone.join(".git").is_dir());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("interactive identity prompt"));
 }

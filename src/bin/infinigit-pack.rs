@@ -9,7 +9,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const CHUNK_SIZE: usize = 512 * 1024;
@@ -66,7 +66,11 @@ fn icp_json(canister: &str, method: &str, argument: &str) -> Value {
     } else if let Some(root) = env::var_os("INFINIGIT_PROJECT_ROOT") {
         command.arg("--project-root-override").arg(root);
     }
-    let output = command.output().unwrap_or_else(|e| fail(e.to_string()));
+    let output = command
+        .stdin(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .output()
+        .unwrap_or_else(|e| fail(e.to_string()));
     let _ = fs::remove_file(&path);
     if !output.status.success() {
         fail(String::from_utf8_lossy(&output.stderr));

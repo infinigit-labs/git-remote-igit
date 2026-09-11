@@ -128,6 +128,8 @@ fn resolve_repository(
         command.args(["--project-root-override", &project_root]);
     }
     let output = command
+        .stdin(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .output()
         .unwrap_or_else(|e| fail(format!("cannot query the InfiniGit directory: {e}")));
     if !output.status.success() {
