@@ -22,7 +22,7 @@ fn git(cwd: &Path, data: &Path, args: &[&str]) -> Output {
         .env("PATH", path)
         .env("INFINIGIT_DATA_DIR", data)
         .env("INFINIGIT_PRINCIPAL", PRINCIPAL)
-        // This test process explicitly trusts the installed InfiniGit helper;
+        // This test process explicitly trusts the installed infinigit helper;
         // Git otherwise blocks custom protocols in recursive submodule clones.
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "protocol.igit.allow")
@@ -38,7 +38,7 @@ fn git(cwd: &Path, data: &Path, args: &[&str]) -> Output {
 }
 
 fn configure(repo: &Path, data: &Path) {
-    git(repo, data, &["config", "user.name", "InfiniGit Test"]);
+    git(repo, data, &["config", "user.name", "infinigit Test"]);
     git(
         repo,
         data,

@@ -1,6 +1,6 @@
 # git-remote-igit
 
-Git remote helper for InfiniGit's native `igit://` transport.
+Git remote helper for infinigit's native `igit://` transport.
 
 ```bash
 cargo install git-remote-igit
@@ -9,12 +9,12 @@ git clone igit://infinigit.com/username/repository
 ```
 
 Git discovers the executable by its `git-remote-igit` name. The helper resolves
-human-readable repository coordinates through the InfiniGit directory and
+human-readable repository coordinates through the infinigit directory and
 uses the bundled `infinigit-pack` bridge to synchronize canister packfiles.
 `infinigit.com` automatically selects the ICP mainnet and production directory;
 no environment variables or Git configuration are required for public clones.
 Explicit configuration remains available for local development and other
-InfiniGit installations.
+infinigit installations.
 
 ## Releases
 

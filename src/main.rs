@@ -1,4 +1,4 @@
-//! Git remote-helper gateway for local InfiniGit development.
+//! Git remote-helper gateway for local infinigit development.
 //!
 //! Git invokes this executable for `igit://<host>/<username>/<repo>` remotes.
 //! It resolves the username through the directory canister, then hands the smart protocol to
@@ -43,7 +43,7 @@ fn parse_remote(url: &str) -> Result<(Option<&str>, &str, &str), String> {
         _ => return Err("remote must contain a host, username, and repository".into()),
     };
     if namespace == "2vxsx-fae" || !valid_atom(namespace) {
-        return Err("a valid InfiniGit username is required".into());
+        return Err("a valid infinigit username is required".into());
     }
     if !valid_atom(repository) {
         return Err("invalid repository name".into());
@@ -107,7 +107,7 @@ fn validate_host(host: Option<&str>, configured_host: Option<&str>) -> Result<()
     match (host, configured_host) {
         (Some(PRODUCTION_HOST), _) => Ok(()),
         (Some(host), Some(configured)) if host != configured => {
-            Err(format!("unknown InfiniGit host: {host}"))
+            Err(format!("unknown infinigit host: {host}"))
         }
         _ => Ok(()),
     }
@@ -172,7 +172,7 @@ fn resolve_repository(
         .stdin(Stdio::inherit())
         .stderr(Stdio::inherit())
         .output()
-        .unwrap_or_else(|e| fail(format!("cannot query the InfiniGit directory: {e}")));
+        .unwrap_or_else(|e| fail(format!("cannot query the infinigit directory: {e}")));
     if !output.status.success() {
         fail("repository not found")
     }
@@ -526,7 +526,7 @@ mod tests {
         assert!(validate_host(Some("git.example"), None).is_ok());
         assert_eq!(
             validate_host(Some("other.example"), Some("git.example")),
-            Err("unknown InfiniGit host: other.example".into())
+            Err("unknown infinigit host: other.example".into())
         );
     }
 }
