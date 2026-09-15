@@ -16,6 +16,14 @@ no environment variables or Git configuration are required for public clones.
 Explicit configuration remains available for local development and other
 infinigit installations.
 
+The helper automatically negotiates transport capabilities with each storage
+shard. New shards use batched resumable pack uploads, multi-chunk downloads,
+changed-ref object negotiation, incremental packs, immutable local pack-index
+caching, and bounded adaptive concurrency. If a shard predates those APIs, the
+same binary falls back to the original endpoints without changing Git
+semantics. Set `INFINIGIT_DISABLE_TRANSPORT_V2=1` to force that compatibility
+path, or `INFINIGIT_TRANSPORT_TIMINGS=1` to print phase-level timings.
+
 ## Releases
 
 See [PUBLISHING.md](PUBLISHING.md) for registry setup, versioning, publishing,
