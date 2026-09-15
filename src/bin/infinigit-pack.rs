@@ -1,20 +1,232 @@
 use candid_parser::candid::{
-    IDLArgs,
+    IDLArgs, Principal, TypeEnv,
     types::{Label, value::IDLValue},
+};
+use candid_parser::{IDLProg, check_prog, parse_idl_args};
+use ic_agent::{
+    Agent, Identity,
+    identity::{BasicIdentity, Prime256v1Identity, Secp256k1Identity},
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 const CHUNK_SIZE: usize = 512 * 1024;
 const INLINE_OBJECT_LIMIT: usize = 128 * 1024;
+const PACK_DID: &str = r#"
+type Kind = variant { "blob"; "tree"; "commit"; "tag" };
+type Ref = record { name : text; oid : text };
+type Object = record { kind : Kind; payload : blob };
+type ObjectEntry = record { oid : text; git_object : Object };
+type Metadata = record { oid : text; kind : Kind; size : nat };
+type RefChange = record { name : text; expected_old : opt text; new : opt text };
+type ChunkReceipt = record { index : nat; uploaded_chunks : nat; chunk_count : nat };
+type Chunked = record { oid : text; kind : Kind; total_size : nat; chunk_size : nat; chunk_count : nat; uploaded_chunks : vec nat; complete : bool };
+type Pack = record { pack_id : text; total_size : nat; chunk_size : nat; chunk_count : nat; uploaded_chunks : vec nat; complete : bool; indexed_objects : nat };
+type Prune = record { removed_packs : nat; removed_logical_bytes : nat; reclaimed_physical_bytes : nat };
+type ResultRefs = variant { ok : vec Ref; err : text };
+type ResultTexts = variant { ok : vec text; err : text };
+type ResultNat = variant { ok : nat; err : text };
+type ResultChunk = variant { ok : ChunkReceipt; err : text };
+type ResultChunked = variant { ok : Chunked; err : text };
+type ResultPack = variant { ok : Pack; err : text };
+type ResultPacks = variant { ok : vec Pack; err : text };
+type ResultBlob = variant { ok : blob; err : text };
+type ResultPrune = variant { ok : Prune; err : text };
+service : {
+  list_refs : (principal, text) -> (ResultRefs) query;
+  list_packs : (principal, text) -> (ResultPacks) query;
+  missing_objects : (principal, text, vec text, bool) -> (ResultTexts) query;
+  begin_pack : (principal, text, text, nat, nat) -> (ResultPack);
+  put_pack_chunk : (principal, text, text, nat, text, blob) -> (ResultChunk);
+  finalize_pack : (principal, text, text) -> (ResultPack);
+  list_pack_objects : (principal, text, text) -> (ResultTexts) query;
+  index_pack_objects_batch : (principal, text, text, vec Metadata, bool) -> (ResultNat);
+  put_objects_batch : (principal, text, vec ObjectEntry) -> (ResultTexts);
+  update_refs_atomic : (principal, text, vec RefChange) -> (ResultRefs);
+  prune_packs : (principal, text, vec text) -> (ResultPrune);
+  get_pack_chunk : (principal, text, text, nat) -> (ResultBlob) query;
+  begin_chunked_object : (principal, text, text, Kind, nat, nat) -> (ResultChunked);
+  put_object_chunk : (principal, text, text, nat, blob) -> (ResultChunk);
+  finalize_chunked_object : (principal, text, text) -> (ResultChunked);
+}"#;
 static ARGUMENT_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static AGENT_CLIENT: OnceLock<Option<AgentClient>> = OnceLock::new();
+static CANISTER_IDS: OnceLock<Mutex<BTreeMap<String, Principal>>> = OnceLock::new();
+
+struct AgentClient {
+    agent: Agent,
+    runtime: tokio::runtime::Runtime,
+    did: String,
+    icp: String,
+}
+
+fn command_output(program: &str, args: &[String]) -> Option<Vec<u8>> {
+    let output = Command::new(program).args(args).output().ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
+fn agent_client() -> Option<&'static AgentClient> {
+    AGENT_CLIENT
+        .get_or_init(|| {
+            let network = env::var("INFINIGIT_AGENT_URL").ok().or_else(|| {
+                match env::var("INFINIGIT_NETWORK").ok().as_deref() {
+                    Some("ic") => Some("https://icp-api.io".into()),
+                    Some(value) if value.contains("://") => Some(value.into()),
+                    _ => None,
+                }
+            })?;
+            let icp = env::var("INFINIGIT_ICP_BIN").unwrap_or_else(|_| "icp".into());
+            let identity_name = env::var("INFINIGIT_IDENTITY").ok().or_else(|| {
+                String::from_utf8(command_output(
+                    &icp,
+                    &["identity".into(), "default".into()],
+                )?)
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+            })?;
+            let mut export_args = vec!["identity".into(), "export".into(), identity_name.clone()];
+            if let Ok(path) = env::var("INFINIGIT_IDENTITY_PASSWORD_FILE") {
+                export_args.extend(["--password-file".into(), path]);
+            }
+            let pem = command_output(&icp, &export_args)?;
+            let identity: Arc<dyn Identity> = if let Ok(value) = Secp256k1Identity::from_pem(&pem) {
+                Arc::new(value)
+            } else if let Ok(value) = Prime256v1Identity::from_pem(&pem) {
+                Arc::new(value)
+            } else if let Ok(value) = BasicIdentity::from_pem(&pem) {
+                Arc::new(value)
+            } else {
+                return None;
+            };
+            let expected = String::from_utf8(command_output(
+                &icp,
+                &[
+                    "identity".into(),
+                    "principal".into(),
+                    "--identity".into(),
+                    identity_name,
+                ],
+            )?)
+            .ok()?
+            .trim()
+            .to_owned();
+            if identity.sender().ok()?.to_text() != expected {
+                return None;
+            }
+            let did = env::var("INFINIGIT_SHARD_CANDID")
+                .ok()
+                .and_then(|path| fs::read_to_string(path).ok())
+                .unwrap_or_else(|| PACK_DID.into());
+            let agent = Agent::builder()
+                .with_url(network.clone())
+                .with_arc_identity(identity)
+                .build()
+                .ok()?;
+            let runtime = tokio::runtime::Runtime::new().ok()?;
+            if network != "https://icp-api.io" && runtime.block_on(agent.fetch_root_key()).is_err()
+            {
+                return None;
+            }
+            Some(AgentClient {
+                agent,
+                runtime,
+                did,
+                icp,
+            })
+        })
+        .as_ref()
+}
+
+fn canister_principal(client: &AgentClient, canister: &str) -> Result<Principal, String> {
+    if let Ok(principal) = Principal::from_text(canister) {
+        return Ok(principal);
+    }
+    let ids = CANISTER_IDS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Some(principal) = ids.lock().map_err(|error| error.to_string())?.get(canister) {
+        return Ok(*principal);
+    }
+    let output = command_output(
+        &client.icp,
+        &[
+            "canister".into(),
+            "status".into(),
+            canister.into(),
+            "--json".into(),
+        ],
+    )
+    .ok_or_else(|| format!("cannot resolve canister name {canister}"))?;
+    let status: Value = serde_json::from_slice(&output).map_err(|error| error.to_string())?;
+    let id = status
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("canister status returned no id for {canister}"))?;
+    let principal = Principal::from_text(id).map_err(|error| error.to_string())?;
+    ids.lock()
+        .map_err(|error| error.to_string())?
+        .insert(canister.into(), principal);
+    Ok(principal)
+}
+
+fn agent_json(
+    client: &AgentClient,
+    canister: &str,
+    method: &str,
+    argument: &str,
+) -> Result<Value, String> {
+    let ast = client
+        .did
+        .parse::<IDLProg>()
+        .map_err(|error| error.to_string())?;
+    let mut type_env = TypeEnv::new();
+    let actor = check_prog(&mut type_env, &ast)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Candid contract has no service actor".to_owned())?;
+    let signature = type_env
+        .get_method(&actor, method)
+        .map_err(|error| error.to_string())?;
+    let args = parse_idl_args(argument)
+        .map_err(|error| error.to_string())?
+        .to_bytes_with_types(&type_env, &signature.args)
+        .map_err(|error| error.to_string())?;
+    let principal = canister_principal(client, canister)?;
+    let bytes = if signature.is_query() {
+        client
+            .runtime
+            .block_on(client.agent.query(&principal, method).with_arg(args).call())
+            .map_err(|error| error.to_string())?
+    } else {
+        client
+            .runtime
+            .block_on(
+                client
+                    .agent
+                    .update(&principal, method)
+                    .with_arg(args)
+                    .call_and_wait(),
+            )
+            .map_err(|error| error.to_string())?
+    };
+    let decoded = IDLArgs::from_bytes_with_types(&bytes, &type_env, &signature.rets)
+        .map_err(|error| error.to_string())?;
+    Ok(decoded
+        .args
+        .into_iter()
+        .next()
+        .map(idl_json)
+        .unwrap_or(Value::Null))
+}
 
 fn fail(message: impl AsRef<str>) -> ! {
     eprintln!("infinigit-pack: {}", message.as_ref());
@@ -33,6 +245,19 @@ fn run(command: &mut Command) -> Output {
 }
 
 fn icp_json(canister: &str, method: &str, argument: &str) -> Value {
+    if let Ok(path) = env::var("INFINIGIT_TRANSPORT_TRACE") {
+        if let Ok(mut trace) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(trace, "{method}");
+        }
+    }
+    if let Some(client) = agent_client() {
+        return agent_json(client, canister, method, argument).unwrap_or_else(|error| {
+            fail(format!("direct ICP agent call failed ({method}): {error}"))
+        });
+    }
+    if env::var("INFINIGIT_REQUIRE_AGENT").ok().as_deref() == Some("1") {
+        fail("command-scoped ICP agent is unavailable")
+    }
     let sequence = ARGUMENT_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let path = env::temp_dir().join(format!(
         "infinigit-candid-{}-{sequence}.did",
@@ -91,6 +316,33 @@ fn icp_json(canister: &str, method: &str, argument: &str) -> Value {
         .next()
         .map(idl_json)
         .unwrap_or(Value::Null)
+}
+
+fn parallel_icp_calls(canister: &str, calls: Vec<(String, String)>) -> Vec<Value> {
+    let concurrency = env::var("INFINIGIT_UPLOAD_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(4)
+        .clamp(1, 16);
+    let mut results = Vec::with_capacity(calls.len());
+    for group in calls.chunks(concurrency) {
+        let mut values = Vec::with_capacity(group.len());
+        std::thread::scope(|scope| {
+            let handles = group
+                .iter()
+                .map(|(method, argument)| scope.spawn(move || icp_json(canister, method, argument)))
+                .collect::<Vec<_>>();
+            for handle in handles {
+                values.push(
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| fail("parallel canister call panicked")),
+                )
+            }
+        });
+        results.extend(values);
+    }
+    results
 }
 
 fn label_text(label: Label) -> String {
@@ -238,29 +490,156 @@ fn local_refs(git_dir: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
-fn candid_refs(refs: &[(String, String)]) -> String {
-    refs.iter()
-        .map(|(name, oid)| format!("record {{ name = \"{name}\"; oid = \"{oid}\" }}"))
+fn all_object_ids(git_dir: &Path) -> Vec<String> {
+    let output = git(git_dir, &["rev-list", "--objects", "--all"]);
+    let mut ids = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn missing_objects(
+    canister: &str,
+    owner: &str,
+    repo: &str,
+    ids: &[String],
+    browse_only: bool,
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    for batch in ids.chunks(500) {
+        let values = batch
+            .iter()
+            .map(|oid| format!("\"{oid}\""))
+            .collect::<Vec<_>>()
+            .join(";");
+        let result = icp_json(
+            canister,
+            "missing_objects",
+            &format!("(principal \"{owner}\", \"{repo}\", vec {{{values}}}, {browse_only})"),
+        );
+        missing.extend(
+            result
+                .get("ok")
+                .and_then(Value::as_array)
+                .unwrap_or_else(|| fail(format!("object negotiation rejected: {result}")))
+                .iter()
+                .map(|value| value.as_str().unwrap().to_owned()),
+        );
+    }
+    missing
+}
+
+fn create_incremental_pack(git_dir: &Path, ids: &[String]) -> Option<String> {
+    if ids.is_empty() {
+        return None;
+    }
+    let pack_dir = git_dir.join("objects/pack");
+    fs::create_dir_all(&pack_dir).unwrap_or_else(|error| fail(error.to_string()));
+    let base = pack_dir.join("pack");
+    let mut child = Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["pack-objects", base.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap_or_else(|error| fail(format!("cannot start git pack-objects: {error}")));
+    {
+        let input = child.stdin.as_mut().unwrap();
+        for oid in ids {
+            writeln!(input, "{oid}").unwrap_or_else(|error| fail(error.to_string()));
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|error| fail(error.to_string()));
+    if !output.status.success() {
+        fail("git pack-objects failed")
+    }
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if id.len() != 40 {
+        fail("git pack-objects returned an invalid pack id")
+    }
+    Some(id)
+}
+
+fn canister_pack_ids(canister: &str, owner: &str, repo: &str) -> Vec<String> {
+    let result = icp_json(
+        canister,
+        "list_packs",
+        &format!("(principal \"{owner}\", \"{repo}\")"),
+    );
+    result
+        .get("ok")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| fail(format!("pack listing rejected: {result}")))
+        .iter()
+        .filter_map(|pack| {
+            pack.get("pack_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+fn candid_ref_changes(expected: &[(String, String)], desired: &[(String, String)]) -> String {
+    let names = expected
+        .iter()
+        .map(|v| &v.0)
+        .chain(desired.iter().map(|v| &v.0))
+        .collect::<BTreeSet<_>>();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let old = expected.iter().find(|v| &v.0 == name).map(|v| v.1.as_str());
+            let new = desired.iter().find(|v| &v.0 == name).map(|v| v.1.as_str());
+            (old != new).then(|| {
+                format!(
+                    "record {{ name = \"{name}\"; expected_old = {}; new = {} }}",
+                    old.map(|v| format!("opt \"{v}\""))
+                        .unwrap_or_else(|| "null".into()),
+                    new.map(|v| format!("opt \"{v}\""))
+                        .unwrap_or_else(|| "null".into())
+                )
+            })
+        })
         .collect::<Vec<_>>()
         .join(";")
 }
 
 fn upload(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
     let expected_refs = canister_refs(canister, owner, repo);
-    git(git_dir, &["repack", "-a", "-d"]);
+    let mut desired_pack_ids = canister_pack_ids(canister, owner, repo);
+    let missing = missing_objects(canister, owner, repo, &all_object_ids(git_dir), false);
+    if desired_pack_ids.len() >= 90 {
+        git(git_dir, &["repack", "-a", "-d"]);
+        desired_pack_ids.clear();
+        let pack_dir = git_dir.join("objects/pack");
+        desired_pack_ids.extend(
+            fs::read_dir(pack_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|value| value == "pack"))
+                .map(|path| pack_id(&fs::read(path).unwrap())),
+        );
+    } else if let Some(id) = create_incremental_pack(git_dir, &missing) {
+        desired_pack_ids.push(id)
+    }
+    desired_pack_ids.sort();
+    desired_pack_ids.dedup();
     let pack_dir = git_dir.join("objects/pack");
-    let mut packs: Vec<PathBuf> = fs::read_dir(&pack_dir)
-        .unwrap_or_else(|e| fail(e.to_string()))
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|value| value == "pack"))
-        .collect();
-    packs.sort();
-    let mut desired_pack_ids = Vec::new();
-    for path in packs {
+    for id in desired_pack_ids.clone() {
+        let path = pack_dir.join(format!("pack-{id}.pack"));
         let bytes = fs::read(&path).unwrap_or_else(|e| fail(e.to_string()));
-        let id = pack_id(&bytes);
-        desired_pack_ids.push(id.clone());
+        if pack_id(&bytes) != id {
+            fail(format!("local pack checksum mismatch: {id}"))
+        }
         let begin = icp_json(
             canister,
             "begin_pack",
@@ -275,13 +654,19 @@ fn upload(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if !complete {
-            for (index, chunk) in bytes.chunks(CHUNK_SIZE).enumerate() {
-                let digest = format!("{:x}", Sha256::digest(chunk));
-                let argument = format!(
-                    "(principal \"{owner}\", \"{repo}\", \"{id}\", {index}, \"{digest}\", {})",
-                    candid_blob(chunk)
-                );
-                let result = icp_json(canister, "put_pack_chunk", &argument);
+            let calls = bytes
+                .chunks(CHUNK_SIZE)
+                .enumerate()
+                .map(|(index, chunk)| {
+                    let digest = format!("{:x}", Sha256::digest(chunk));
+                    let argument = format!(
+                        "(principal \"{owner}\", \"{repo}\", \"{id}\", {index}, \"{digest}\", {})",
+                        candid_blob(chunk)
+                    );
+                    ("put_pack_chunk".into(), argument)
+                })
+                .collect::<Vec<_>>();
+            for result in parallel_icp_calls(canister, calls) {
                 if result.get("ok").is_none() {
                     fail(format!("chunk upload rejected: {result}"));
                 }
@@ -297,23 +682,47 @@ fn upload(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
         }
         let index = path.with_extension("idx");
         let objects = pack_object_metadata(git_dir, &index);
-        let candid_objects = objects
-            .iter()
-            .map(|object| {
-                format!(
-                    "record {{ oid = \"{}\"; kind = variant {{ \"{}\" }}; size = {} }}",
-                    object.oid, object.kind, object.size
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(";");
-        let indexed = icp_json(
+        let listed = icp_json(
             canister,
-            "index_pack_objects",
-            &format!("(principal \"{owner}\", \"{repo}\", \"{id}\", vec {{{candid_objects}}})"),
+            "list_pack_objects",
+            &format!("(principal \"{owner}\", \"{repo}\", \"{id}\")"),
         );
-        if indexed.get("ok").is_none() {
-            fail(format!("pack index rejected: {indexed}"));
+        let already = listed
+            .get("ok")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let pending = objects
+            .iter()
+            .filter(|object| !already.contains(object.oid.as_str()))
+            .collect::<Vec<_>>();
+        for (batch_index, batch) in pending.chunks(500).enumerate() {
+            let candid_objects = batch
+                .iter()
+                .map(|object| {
+                    format!(
+                        "record {{ oid = \"{}\"; kind = variant {{ \"{}\" }}; size = {} }}",
+                        object.oid, object.kind, object.size
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(";");
+            let indexed = icp_json(
+                canister,
+                "index_pack_objects_batch",
+                &format!(
+                    "(principal \"{owner}\", \"{repo}\", \"{id}\", vec {{{candid_objects}}}, {})",
+                    already.is_empty() && batch_index == 0
+                ),
+            );
+            if indexed.get("ok").is_none() {
+                fail(format!("pack index batch rejected: {indexed}"));
+            }
         }
     }
 
@@ -323,17 +732,16 @@ fn upload(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
     index_browse_objects(canister, owner, repo, git_dir);
 
     let desired_refs = local_refs(git_dir);
-    let result = icp_json(
-        canister,
-        "replace_refs_atomic",
-        &format!(
-            "(principal \"{owner}\", \"{repo}\", vec {{{}}}, vec {{{}}})",
-            candid_refs(&expected_refs),
-            candid_refs(&desired_refs)
-        ),
-    );
-    if result.get("ok").is_none() {
-        fail(format!("atomic ref publication rejected: {result}"));
+    let changes = candid_ref_changes(&expected_refs, &desired_refs);
+    if !changes.is_empty() {
+        let result = icp_json(
+            canister,
+            "update_refs_atomic",
+            &format!("(principal \"{owner}\", \"{repo}\", vec {{{changes}}})"),
+        );
+        if result.get("ok").is_none() {
+            fail(format!("atomic ref publication rejected: {result}"));
+        }
     }
     let keep = desired_pack_ids
         .iter()
@@ -383,13 +791,24 @@ fn materialize(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
             .unwrap()
             .parse()
             .unwrap();
+        let path = pack_dir.join(format!("pack-{id}.pack"));
+        if fs::read(&path).is_ok_and(|bytes| bytes.len() >= 20 && pack_id(&bytes) == id) {
+            let index = path.with_extension("idx");
+            if !index.exists() {
+                git(git_dir, &["index-pack", path.to_str().unwrap()]);
+            }
+            continue;
+        }
+        let calls = (0..count)
+            .map(|index| {
+                (
+                    "get_pack_chunk".into(),
+                    format!("(principal \"{owner}\", \"{repo}\", \"{id}\", {index})"),
+                )
+            })
+            .collect();
         let mut bytes = Vec::new();
-        for index in 0..count {
-            let chunk = icp_json(
-                canister,
-                "get_pack_chunk",
-                &format!("(principal \"{owner}\", \"{repo}\", \"{id}\", {index})"),
-            );
+        for chunk in parallel_icp_calls(canister, calls) {
             let data = chunk
                 .get("ok")
                 .and_then(Value::as_array)
@@ -399,7 +818,6 @@ fn materialize(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
         if pack_id(&bytes) != id {
             fail(format!("pack checksum mismatch: {id}"));
         }
-        let path = pack_dir.join(format!("pack-{id}.pack"));
         let already_present = fs::read(&path).is_ok_and(|existing| existing == bytes);
         if !already_present {
             if path.exists() {
@@ -442,15 +860,27 @@ fn materialize(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
 }
 
 fn index_browse_objects(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
-    let listed = git(git_dir, &["rev-list", "--objects", "--all"]);
-    let mut object_ids = String::from_utf8_lossy(&listed.stdout)
-        .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    object_ids.sort_unstable();
-    object_ids.dedup();
-    for oid in object_ids {
+    let object_ids = all_object_ids(git_dir);
+    let missing = missing_objects(canister, owner, repo, &object_ids, true);
+    let mut batch = Vec::<(String, String, Vec<u8>)>::new();
+    let mut batch_bytes = 0usize;
+    let flush = |batch: &mut Vec<(String, String, Vec<u8>)>, batch_bytes: &mut usize| {
+        if batch.is_empty() {
+            return;
+        }
+        let objects = batch.iter().map(|(oid, kind, payload)| format!("record {{ oid = \"{oid}\"; git_object = record {{ kind = variant {{ \"{kind}\" }}; payload = {} }} }}", candid_blob(payload))).collect::<Vec<_>>().join(";");
+        let result = icp_json(
+            canister,
+            "put_objects_batch",
+            &format!("(principal \"{owner}\", \"{repo}\", vec {{{objects}}})"),
+        );
+        if result.get("ok").is_none() {
+            fail(format!("browse object batch rejected: {result}"))
+        }
+        batch.clear();
+        *batch_bytes = 0;
+    };
+    for oid in missing {
         let kind_output = git(git_dir, &["cat-file", "-t", &oid]);
         let kind = String::from_utf8_lossy(&kind_output.stdout)
             .trim()
@@ -459,8 +889,18 @@ fn index_browse_objects(canister: &str, owner: &str, repo: &str, git_dir: &Path)
             fail(format!("unsupported browse object type: {kind}"));
         }
         let payload = git(git_dir, &["cat-file", &kind, &oid]).stdout;
-        index_browse_object(canister, owner, repo, &oid, &kind, &payload);
+        if should_inline_object(payload.len()) {
+            if batch.len() == 100 || batch_bytes + payload.len() > 1_250_000 {
+                flush(&mut batch, &mut batch_bytes)
+            }
+            batch_bytes += payload.len();
+            batch.push((oid, kind, payload));
+        } else {
+            flush(&mut batch, &mut batch_bytes);
+            index_browse_object(canister, owner, repo, &oid, &kind, &payload);
+        }
     }
+    flush(&mut batch, &mut batch_bytes);
 }
 
 fn index_browse_object(
@@ -502,15 +942,20 @@ fn index_browse_object(
     if complete {
         return;
     }
-    for (index, chunk) in payload.chunks(CHUNK_SIZE).enumerate() {
-        let result = icp_json(
-            canister,
-            "put_object_chunk",
-            &format!(
-                "(principal \"{owner}\", \"{repo}\", \"{oid}\", {index}, {})",
-                candid_blob(chunk)
-            ),
-        );
+    let calls = payload
+        .chunks(CHUNK_SIZE)
+        .enumerate()
+        .map(|(index, chunk)| {
+            (
+                "put_object_chunk".into(),
+                format!(
+                    "(principal \"{owner}\", \"{repo}\", \"{oid}\", {index}, {})",
+                    candid_blob(chunk)
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    for result in parallel_icp_calls(canister, calls) {
         if result.get("ok").is_none() {
             fail(format!("browse object chunk upload rejected: {result}"));
         }
@@ -560,5 +1005,45 @@ mod tests {
     fn selects_inline_and_chunked_object_boundaries() {
         assert!(should_inline_object(INLINE_OBJECT_LIMIT));
         assert!(!should_inline_object(INLINE_OBJECT_LIMIT + 1));
+    }
+    #[test]
+    fn emits_only_changed_ref_operations_including_deletions() {
+        let expected = vec![
+            ("refs/heads/main".into(), "11".repeat(20)),
+            ("refs/heads/old".into(), "22".repeat(20)),
+        ];
+        let desired = vec![
+            ("refs/heads/main".into(), "11".repeat(20)),
+            ("refs/heads/new".into(), "33".repeat(20)),
+        ];
+        let changes = candid_ref_changes(&expected, &desired);
+        assert!(!changes.contains("refs/heads/main"));
+        assert!(changes.contains("refs/heads/old") && changes.contains("new = null"));
+        assert!(changes.contains("refs/heads/new") && changes.contains("expected_old = null"));
+    }
+    #[test]
+    fn embedded_agent_contract_covers_every_transport_call() {
+        let ast = PACK_DID.parse::<IDLProg>().unwrap();
+        let mut env = TypeEnv::new();
+        let actor = check_prog(&mut env, &ast).unwrap().unwrap();
+        for method in [
+            "list_refs",
+            "list_packs",
+            "missing_objects",
+            "begin_pack",
+            "put_pack_chunk",
+            "finalize_pack",
+            "list_pack_objects",
+            "index_pack_objects_batch",
+            "put_objects_batch",
+            "update_refs_atomic",
+            "prune_packs",
+            "get_pack_chunk",
+            "begin_chunked_object",
+            "put_object_chunk",
+            "finalize_chunked_object",
+        ] {
+            assert!(env.get_method(&actor, method).is_ok(), "missing {method}");
+        }
     }
 }
