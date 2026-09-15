@@ -30,11 +30,13 @@ type Object = record { kind : Kind; payload : blob };
 type ObjectEntry = record { oid : text; git_object : Object };
 type Metadata = record { oid : text; kind : Kind; size : nat };
 type RefChange = record { name : text; expected_old : opt text; new : opt text };
+type RefTransactionReceipt = record { transaction_id : text; uploaded_pages : nat; change_count : nat; updated_at : int };
 type ChunkReceipt = record { index : nat; uploaded_chunks : nat; chunk_count : nat };
 type Chunked = record { oid : text; kind : Kind; total_size : nat; chunk_size : nat; chunk_count : nat; uploaded_chunks : vec nat; complete : bool };
 type Pack = record { pack_id : text; total_size : nat; chunk_size : nat; chunk_count : nat; uploaded_chunks : vec nat; complete : bool; indexed_objects : nat };
 type Prune = record { removed_packs : nat; removed_logical_bytes : nat; reclaimed_physical_bytes : nat };
 type ResultRefs = variant { ok : vec Ref; err : text };
+type ResultRefTransaction = variant { ok : RefTransactionReceipt; err : text };
 type ResultTexts = variant { ok : vec text; err : text };
 type ResultNat = variant { ok : nat; err : text };
 type ResultChunk = variant { ok : ChunkReceipt; err : text };
@@ -54,6 +56,9 @@ service : {
   index_pack_objects_batch : (principal, text, text, vec Metadata, bool) -> (ResultNat);
   put_objects_batch : (principal, text, vec ObjectEntry) -> (ResultTexts);
   update_refs_atomic : (principal, text, vec RefChange) -> (ResultRefs);
+  stage_ref_transaction_page : (principal, text, text, nat, nat, vec RefChange) -> (ResultRefTransaction);
+  commit_ref_transaction : (principal, text, text) -> (ResultRefs);
+  abort_ref_transaction : (principal, text, text) -> (variant { ok; err : text });
   prune_packs : (principal, text, vec text) -> (ResultPrune);
   get_pack_chunk : (principal, text, text, nat) -> (ResultBlob) query;
   begin_chunked_object : (principal, text, text, Kind, nat, nat) -> (ResultChunked);
@@ -587,7 +592,7 @@ fn canister_pack_ids(canister: &str, owner: &str, repo: &str) -> Vec<String> {
         .collect()
 }
 
-fn candid_ref_changes(expected: &[(String, String)], desired: &[(String, String)]) -> String {
+fn candid_ref_changes(expected: &[(String, String)], desired: &[(String, String)]) -> Vec<String> {
     let names = expected
         .iter()
         .map(|v| &v.0)
@@ -608,8 +613,56 @@ fn candid_ref_changes(expected: &[(String, String)], desired: &[(String, String)
                 )
             })
         })
-        .collect::<Vec<_>>()
-        .join(";")
+        .collect()
+}
+
+fn publish_ref_changes(canister: &str, owner: &str, repo: &str, changes: &[String]) {
+    if changes.is_empty() {
+        return;
+    }
+    if changes.len() <= 100 {
+        let result = icp_json(
+            canister,
+            "update_refs_atomic",
+            &format!(
+                "(principal \"{owner}\", \"{repo}\", vec {{{}}})",
+                changes.join(";")
+            ),
+        );
+        if result.get("ok").is_none() {
+            fail(format!("atomic ref publication rejected: {result}"));
+        }
+        return;
+    }
+    let transaction_id = format!("{:x}", Sha256::digest(changes.join(";").as_bytes()));
+    let pages = changes.chunks(100).collect::<Vec<_>>();
+    for (index, page) in pages.iter().enumerate() {
+        let result = icp_json(
+            canister,
+            "stage_ref_transaction_page",
+            &format!(
+                "(principal \"{owner}\", \"{repo}\", \"{transaction_id}\", {} : nat, {index} : nat, vec {{{}}})",
+                pages.len(),
+                page.join(";")
+            ),
+        );
+        if result.get("ok").is_none() {
+            let _ = icp_json(
+                canister,
+                "abort_ref_transaction",
+                &format!("(principal \"{owner}\", \"{repo}\", \"{transaction_id}\")"),
+            );
+            fail(format!("ref transaction page rejected: {result}"));
+        }
+    }
+    let result = icp_json(
+        canister,
+        "commit_ref_transaction",
+        &format!("(principal \"{owner}\", \"{repo}\", \"{transaction_id}\")"),
+    );
+    if result.get("ok").is_none() {
+        fail(format!("atomic ref transaction rejected: {result}"));
+    }
 }
 
 fn upload(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
@@ -733,16 +786,7 @@ fn upload(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
 
     let desired_refs = local_refs(git_dir);
     let changes = candid_ref_changes(&expected_refs, &desired_refs);
-    if !changes.is_empty() {
-        let result = icp_json(
-            canister,
-            "update_refs_atomic",
-            &format!("(principal \"{owner}\", \"{repo}\", vec {{{changes}}})"),
-        );
-        if result.get("ok").is_none() {
-            fail(format!("atomic ref publication rejected: {result}"));
-        }
-    }
+    publish_ref_changes(canister, owner, repo, &changes);
     let keep = desired_pack_ids
         .iter()
         .map(|id| format!("\"{id}\""))
@@ -1017,6 +1061,7 @@ mod tests {
             ("refs/heads/new".into(), "33".repeat(20)),
         ];
         let changes = candid_ref_changes(&expected, &desired);
+        let changes = changes.join(";");
         assert!(!changes.contains("refs/heads/main"));
         assert!(changes.contains("refs/heads/old") && changes.contains("new = null"));
         assert!(changes.contains("refs/heads/new") && changes.contains("expected_old = null"));
@@ -1037,6 +1082,9 @@ mod tests {
             "index_pack_objects_batch",
             "put_objects_batch",
             "update_refs_atomic",
+            "stage_ref_transaction_page",
+            "commit_ref_transaction",
+            "abort_ref_transaction",
             "prune_packs",
             "get_pack_chunk",
             "begin_chunked_object",
