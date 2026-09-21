@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::{
@@ -32,6 +32,7 @@ type ObjectEntry = record { oid : text; git_object : Object };
 type Metadata = record { oid : text; kind : Kind; size : nat };
 type PackChunkUpload = record { index : nat; digest : text; payload : blob };
 type TransportCapabilities = record { version : nat; max_chunk_batch_items : nat; max_chunk_batch_bytes : nat; max_pack_index_batch_items : nat; max_download_batch_items : nat; max_retained_packs : nat; packed_object_reads : bool; streaming_pack_downloads : bool };
+type TransportSnapshot = record { generation : text; unchanged : bool; refs : vec Ref; packs : vec Pack; capabilities : TransportCapabilities };
 type RefChange = record { name : text; expected_old : opt text; new : opt text };
 type RefTransactionReceipt = record { transaction_id : text; uploaded_pages : nat; change_count : nat; updated_at : int };
 type ChunkReceipt = record { index : nat; uploaded_chunks : nat; chunk_count : nat };
@@ -55,6 +56,7 @@ service : {
   begin_pack : (principal, text, text, nat, nat) -> (ResultPack);
   put_pack_chunk : (principal, text, text, nat, text, blob) -> (ResultChunk);
   transport_capabilities : () -> (TransportCapabilities) query;
+  transport_snapshot : (principal, text, opt text) -> (variant { ok : TransportSnapshot; err : text }) query;
   put_pack_chunks : (principal, text, text, vec PackChunkUpload) -> (variant { ok : vec ChunkReceipt; err : text });
   finalize_pack : (principal, text, text) -> (ResultPack);
   list_pack_objects : (principal, text, text) -> (ResultTexts) query;
@@ -95,6 +97,14 @@ struct TransportCapabilities {
     _streaming_pack_downloads: bool,
 }
 
+struct TransportSnapshot {
+    capabilities: TransportCapabilities,
+    refs: Vec<(String, String)>,
+    packs: BTreeMap<String, usize>,
+    pack_values: Vec<Value>,
+    raw: Value,
+}
+
 impl Default for TransportCapabilities {
     fn default() -> Self {
         Self {
@@ -119,7 +129,11 @@ struct TransportTimer {
 impl TransportTimer {
     fn new(operation: &'static str) -> Self {
         let now = Instant::now();
-        Self { operation, started: now, checkpoint: now }
+        Self {
+            operation,
+            started: now,
+            checkpoint: now,
+        }
     }
 
     fn mark(&mut self, phase: &str) {
@@ -411,6 +425,10 @@ fn transport_capabilities(canister: &str) -> TransportCapabilities {
     if env::var("INFINIGIT_TRANSPORT_DEBUG").ok().as_deref() == Some("1") {
         eprintln!("infinigit-pack: transport capabilities: {value}");
     }
+    capabilities_from_value(&value)
+}
+
+fn capabilities_from_value(value: &Value) -> TransportCapabilities {
     TransportCapabilities {
         version: json_usize(&value, "version").unwrap_or(1),
         max_chunk_batch_items: json_usize(&value, "max_chunk_batch_items")
@@ -437,6 +455,143 @@ fn transport_capabilities(canister: &str) -> TransportCapabilities {
             .and_then(Value::as_bool)
             .unwrap_or(false),
     }
+}
+
+fn transport_snapshot(
+    canister: &str,
+    owner: &str,
+    repo: &str,
+    git_dir: &Path,
+) -> Option<TransportSnapshot> {
+    if env::var("INFINIGIT_DISABLE_TRANSPORT_V2").ok().as_deref() == Some("1") {
+        return None;
+    }
+    let client = agent_client()?;
+    if let Ok(path) = env::var("INFINIGIT_TRANSPORT_TRACE") {
+        if let Ok(mut trace) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(trace, "transport_snapshot");
+        }
+    }
+    let cache_path = git_dir.join("infinigit-transport-manifest.json");
+    let cached: Option<Value> = fs::read(&cache_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let known = cached
+        .as_ref()
+        .and_then(|value| value.get("generation"))
+        .and_then(Value::as_str)
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let known_argument = known
+        .map(|value| format!("opt \"{value}\""))
+        .unwrap_or_else(|| "null".into());
+    let value = agent_json(
+        client,
+        canister,
+        "transport_snapshot",
+        &format!("(principal \"{owner}\", \"{repo}\", {known_argument})"),
+    )
+    .ok()?;
+    let snapshot = value.get("ok")?;
+    if snapshot.get("unchanged").and_then(Value::as_bool) == Some(true) {
+        return parse_transport_snapshot(cached.as_ref()?);
+    }
+    let encoded = serde_json::to_vec(snapshot).ok()?;
+    let incoming = cache_path.with_extension("json.incoming");
+    if fs::write(&incoming, encoded).is_ok() {
+        let _ = fs::rename(incoming, cache_path);
+    }
+    let refs = snapshot
+        .get("refs")?
+        .as_array()?
+        .iter()
+        .map(|entry| {
+            Some((
+                entry.get("name")?.as_str()?.to_owned(),
+                entry.get("oid")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let pack_values = snapshot.get("packs")?.as_array()?.clone();
+    let packs = pack_values
+        .iter()
+        .filter_map(|pack| {
+            Some((
+                pack.get("pack_id")?.as_str()?.to_owned(),
+                json_usize(pack, "indexed_objects").unwrap_or(0),
+            ))
+        })
+        .collect();
+    Some(TransportSnapshot {
+        capabilities: capabilities_from_value(snapshot.get("capabilities")?),
+        refs,
+        packs,
+        pack_values,
+        raw: snapshot.clone(),
+    })
+}
+
+fn session_snapshot_path(git_dir: &Path) -> Option<std::path::PathBuf> {
+    env::var("INFINIGIT_TRANSPORT_SESSION")
+        .ok()
+        .filter(|value| {
+            !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+        .map(|_| git_dir.join("infinigit-transport-snapshot.json"))
+}
+
+fn store_session_snapshot(git_dir: &Path, snapshot: &TransportSnapshot) {
+    let Some(path) = session_snapshot_path(git_dir) else {
+        return;
+    };
+    let session = env::var("INFINIGIT_TRANSPORT_SESSION").unwrap();
+    let value = serde_json::json!({ "session": session, "snapshot": snapshot.raw });
+    fs::write(path, serde_json::to_vec(&value).unwrap())
+        .unwrap_or_else(|error| fail(format!("cannot cache transport snapshot: {error}")));
+}
+
+fn take_session_snapshot(git_dir: &Path) -> Option<TransportSnapshot> {
+    let path = session_snapshot_path(git_dir)?;
+    let bytes = fs::read(&path).ok()?;
+    let _ = fs::remove_file(path);
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    if value.get("session")?.as_str()? != env::var("INFINIGIT_TRANSPORT_SESSION").ok()? {
+        return None;
+    }
+    parse_transport_snapshot(value.get("snapshot")?)
+}
+
+fn parse_transport_snapshot(snapshot: &Value) -> Option<TransportSnapshot> {
+    let refs = snapshot
+        .get("refs")?
+        .as_array()?
+        .iter()
+        .map(|entry| {
+            Some((
+                entry.get("name")?.as_str()?.to_owned(),
+                entry.get("oid")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let pack_values = snapshot.get("packs")?.as_array()?.clone();
+    let packs = pack_values
+        .iter()
+        .filter_map(|pack| {
+            Some((
+                pack.get("pack_id")?.as_str()?.to_owned(),
+                json_usize(pack, "indexed_objects").unwrap_or(0),
+            ))
+        })
+        .collect();
+    Some(TransportSnapshot {
+        capabilities: capabilities_from_value(snapshot.get("capabilities")?),
+        refs,
+        packs,
+        pack_values,
+        raw: snapshot.clone(),
+    })
 }
 
 fn for_parallel_icp_calls(
@@ -555,6 +710,68 @@ fn git(git_dir: &Path, args: &[&str]) -> Output {
     run(Command::new("git").arg("--git-dir").arg(git_dir).args(args))
 }
 
+fn read_git_objects(git_dir: &Path, ids: &[String]) -> Vec<(String, String, Vec<u8>)> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let mut child = Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap_or_else(|error| fail(format!("cannot start git cat-file batch: {error}")));
+    {
+        let input = child.stdin.as_mut().unwrap();
+        for oid in ids {
+            writeln!(input, "{oid}").unwrap_or_else(|error| fail(error.to_string()));
+        }
+    }
+    drop(child.stdin.take());
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let mut objects = Vec::with_capacity(ids.len());
+    for expected_oid in ids {
+        let mut header = String::new();
+        output
+            .read_line(&mut header)
+            .unwrap_or_else(|error| fail(format!("cannot read git cat-file header: {error}")));
+        let fields = header.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 3 || fields[0] != expected_oid || fields[1] == "missing" {
+            fail(format!(
+                "invalid git cat-file response for {expected_oid}: {header}"
+            ));
+        }
+        let kind = fields[1].to_owned();
+        if !matches!(kind.as_str(), "blob" | "tree" | "commit" | "tag") {
+            fail(format!("unsupported browse object type: {kind}"));
+        }
+        let size = fields[2]
+            .parse::<usize>()
+            .unwrap_or_else(|_| fail(format!("invalid git object size: {}", fields[2])));
+        let mut payload = vec![0; size];
+        output
+            .read_exact(&mut payload)
+            .unwrap_or_else(|error| fail(format!("cannot read git object: {error}")));
+        let mut terminator = [0];
+        output
+            .read_exact(&mut terminator)
+            .unwrap_or_else(|error| fail(format!("cannot read git object terminator: {error}")));
+        if terminator != [b'\n'] {
+            fail("invalid git cat-file object terminator");
+        }
+        objects.push((expected_oid.clone(), kind, payload));
+    }
+    let status = child
+        .wait()
+        .unwrap_or_else(|error| fail(format!("cannot wait for git cat-file batch: {error}")));
+    if !status.success() {
+        fail("git cat-file batch failed");
+    }
+    objects
+}
+
 fn pack_id(bytes: &[u8]) -> String {
     assert!(bytes.len() >= 20);
     bytes[bytes.len() - 20..]
@@ -569,10 +786,15 @@ fn pack_id_from_file(path: &Path) -> Result<String, String> {
     if length < 20 {
         return Err("pack is shorter than its checksum".into());
     }
-    file.seek(SeekFrom::End(-20)).map_err(|error| error.to_string())?;
+    file.seek(SeekFrom::End(-20))
+        .map_err(|error| error.to_string())?;
     let mut checksum = [0u8; 20];
-    file.read_exact(&mut checksum).map_err(|error| error.to_string())?;
-    Ok(checksum.iter().map(|value| format!("{value:02x}")).collect())
+    file.read_exact(&mut checksum)
+        .map_err(|error| error.to_string())?;
+    Ok(checksum
+        .iter()
+        .map(|value| format!("{value:02x}"))
+        .collect())
 }
 
 struct PackObjectMetadata {
@@ -606,8 +828,13 @@ fn pack_index_object_count(path: &Path) -> Option<usize> {
     let mut file = fs::File::open(path).ok()?;
     let mut prefix = [0u8; 8];
     file.read_exact(&mut prefix).ok()?;
-    let fanout_start = if prefix[..4] == [0xff, b't', b'O', b'c'] { 8 } else { 0 };
-    file.seek(SeekFrom::Start((fanout_start + 255 * 4) as u64)).ok()?;
+    let fanout_start = if prefix[..4] == [0xff, b't', b'O', b'c'] {
+        8
+    } else {
+        0
+    };
+    file.seek(SeekFrom::Start((fanout_start + 255 * 4) as u64))
+        .ok()?;
     let mut count = [0u8; 4];
     file.read_exact(&mut count).ok()?;
     Some(u32::from_be_bytes(count) as usize)
@@ -649,6 +876,50 @@ fn local_refs(git_dir: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
+fn replace_local_refs(git_dir: &Path, remote_refs: &[(String, String)]) {
+    let desired_names = remote_refs
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut commands = String::from("start\n");
+    for (name, _) in local_refs(git_dir) {
+        if !desired_names.contains(name.as_str()) {
+            commands.push_str(&format!("delete {name}\n"));
+        }
+    }
+    for (name, oid) in remote_refs {
+        commands.push_str(&format!("update {name} {oid}\n"));
+    }
+    commands.push_str("prepare\ncommit\n");
+    let mut child = Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["update-ref", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| fail(format!("cannot start git update-ref transaction: {error}")));
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(commands.as_bytes())
+        .unwrap_or_else(|error| fail(format!("cannot write git update-ref transaction: {error}")));
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap_or_else(|error| {
+        fail(format!(
+            "cannot wait for git update-ref transaction: {error}"
+        ))
+    });
+    if !output.status.success() {
+        fail(format!(
+            "git update-ref transaction failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+}
+
 fn all_object_ids(git_dir: &Path) -> Vec<String> {
     let output = git(git_dir, &["rev-list", "--objects", "--all"]);
     let mut ids = String::from_utf8_lossy(&output.stdout)
@@ -666,12 +937,18 @@ fn changed_object_ids(
     expected: &[(String, String)],
     desired: &[(String, String)],
 ) -> Vec<String> {
-    let desired_ids = desired.iter().map(|entry| entry.1.as_str()).collect::<BTreeSet<_>>();
+    let desired_ids = desired
+        .iter()
+        .map(|entry| entry.1.as_str())
+        .collect::<BTreeSet<_>>();
     if desired_ids.is_empty() {
         return Vec::new();
     }
     let mut command = Command::new("git");
-    command.arg("--git-dir").arg(git_dir).args(["rev-list", "--objects"]);
+    command
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["rev-list", "--objects"]);
     for oid in &desired_ids {
         command.arg(oid);
     }
@@ -685,7 +962,9 @@ fn changed_object_ids(
             command.arg(oid);
         }
     }
-    let output = command.output().unwrap_or_else(|error| fail(error.to_string()));
+    let output = command
+        .output()
+        .unwrap_or_else(|error| fail(error.to_string()));
     if !output.status.success() {
         return all_object_ids(git_dir);
     }
@@ -780,10 +1059,12 @@ fn canister_packs(canister: &str, owner: &str, repo: &str) -> BTreeMap<String, u
         .and_then(Value::as_array)
         .unwrap_or_else(|| fail(format!("pack listing rejected: {result}")))
         .iter()
-        .filter_map(|pack| Some((
-            pack.get("pack_id")?.as_str()?.to_owned(),
-            json_usize(pack, "indexed_objects").unwrap_or(0),
-        )))
+        .filter_map(|pack| {
+            Some((
+                pack.get("pack_id")?.as_str()?.to_owned(),
+                json_usize(pack, "indexed_objects").unwrap_or(0),
+            ))
+        })
         .collect()
 }
 
@@ -862,16 +1143,24 @@ fn publish_ref_changes(canister: &str, owner: &str, repo: &str, changes: &[Strin
 
 fn upload(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
     let mut timer = TransportTimer::new("push");
-    let (capabilities, expected_refs, remote_packs) = std::thread::scope(|scope| {
-        let capabilities = scope.spawn(|| transport_capabilities(canister));
-        let refs = scope.spawn(|| canister_refs(canister, owner, repo));
-        let packs = scope.spawn(|| canister_packs(canister, owner, repo));
-        (
-            capabilities.join().unwrap_or_default(),
-            refs.join().unwrap_or_else(|_| fail("ref negotiation panicked")),
-            packs.join().unwrap_or_else(|_| fail("pack negotiation panicked")),
-        )
-    });
+    let (capabilities, expected_refs, remote_packs) = take_session_snapshot(git_dir)
+        .or_else(|| transport_snapshot(canister, owner, repo, git_dir))
+        .map(|snapshot| (snapshot.capabilities, snapshot.refs, snapshot.packs))
+        .unwrap_or_else(|| {
+            std::thread::scope(|scope| {
+                let capabilities = scope.spawn(|| transport_capabilities(canister));
+                let refs = scope.spawn(|| canister_refs(canister, owner, repo));
+                let packs = scope.spawn(|| canister_packs(canister, owner, repo));
+                (
+                    capabilities.join().unwrap_or_default(),
+                    refs.join()
+                        .unwrap_or_else(|_| fail("ref negotiation panicked")),
+                    packs
+                        .join()
+                        .unwrap_or_else(|_| fail("pack negotiation panicked")),
+                )
+            })
+        });
     let desired_refs = local_refs(git_dir);
     let changes = candid_ref_changes(&expected_refs, &desired_refs);
     let mut desired_pack_ids = remote_packs.keys().cloned().collect::<Vec<_>>();
@@ -953,10 +1242,12 @@ fn upload(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
                     }
                     let uploads = chunks[cursor..end]
                         .iter()
-                        .map(|(index, digest, chunk)| format!(
-                            "record {{ index = {index}; digest = \"{digest}\"; payload = {} }}",
-                            candid_blob(chunk)
-                        ))
+                        .map(|(index, digest, chunk)| {
+                            format!(
+                                "record {{ index = {index}; digest = \"{digest}\"; payload = {} }}",
+                                candid_blob(chunk)
+                            )
+                        })
                         .collect::<Vec<_>>()
                         .join(";");
                     calls.push((
@@ -1012,6 +1303,7 @@ fn upload(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
             .filter(|object| !already.contains(object.oid.as_str()))
             .collect::<Vec<_>>();
         let index_batch_size = capabilities.max_pack_index_batch_items;
+        let mut index_calls = Vec::<(String, String)>::new();
         for (batch_index, batch) in pending.chunks(index_batch_size).enumerate() {
             let candid_objects = batch
                 .iter()
@@ -1023,16 +1315,36 @@ fn upload(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
                 })
                 .collect::<Vec<_>>()
                 .join(";");
-            let indexed = icp_json(
-                canister,
-                if capabilities.version >= 2 { "index_pack_objects_batch_v2" } else { "index_pack_objects_batch" },
-                &format!(
+            index_calls.push((
+                if capabilities.version >= 2 {
+                    "index_pack_objects_batch_v2".into()
+                } else {
+                    "index_pack_objects_batch".into()
+                },
+                format!(
                     "(principal \"{owner}\", \"{repo}\", \"{id}\", vec {{{candid_objects}}}, {})",
                     already.is_empty() && batch_index == 0
                 ),
-            );
+            ));
+        }
+        if capabilities.version >= 2 && already.is_empty() && !index_calls.is_empty() {
+            let (method, argument) = index_calls.remove(0);
+            let indexed = icp_json(canister, &method, &argument);
             if indexed.get("ok").is_none() {
                 fail(format!("pack index batch rejected: {indexed}"));
+            }
+        }
+        let indexed = if capabilities.version >= 2 {
+            parallel_icp_calls(canister, index_calls)
+        } else {
+            index_calls
+                .into_iter()
+                .map(|(method, argument)| icp_json(canister, &method, &argument))
+                .collect()
+        };
+        for result in indexed {
+            if result.get("ok").is_none() {
+                fail(format!("pack index batch rejected: {result}"));
             }
         }
     }
@@ -1065,29 +1377,43 @@ fn upload(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
 
 fn materialize(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
     let mut timer = TransportTimer::new("pull");
-    let capabilities_handle = std::thread::spawn({
-        let canister = canister.to_owned();
-        move || transport_capabilities(&canister)
-    });
     if !git_dir.join("HEAD").exists() {
         fs::create_dir_all(git_dir)
             .unwrap_or_else(|e| fail(format!("cannot create {}: {e}", git_dir.display())));
         run(Command::new("git").args(["init", "--bare", git_dir.to_str().unwrap()]));
     }
-    let packs = icp_json(
-        canister,
-        "list_packs",
-        &format!("(principal \"{owner}\", \"{repo}\")"),
-    );
-    let values = packs
-        .get("ok")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| fail(format!("pack listing rejected: {packs}")));
-    let capabilities = capabilities_handle.join().unwrap_or_default();
+    let snapshot = transport_snapshot(canister, owner, repo, git_dir);
+    if let Some(value) = &snapshot {
+        store_session_snapshot(git_dir, value);
+    }
+    let (capabilities, snapshot_refs, values) = if let Some(snapshot) = snapshot {
+        (
+            snapshot.capabilities,
+            Some(snapshot.refs),
+            snapshot.pack_values,
+        )
+    } else {
+        let capabilities_handle = std::thread::spawn({
+            let canister = canister.to_owned();
+            move || transport_capabilities(&canister)
+        });
+        let packs = icp_json(
+            canister,
+            "list_packs",
+            &format!("(principal \"{owner}\", \"{repo}\")"),
+        );
+        let values = packs
+            .get("ok")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| fail(format!("pack listing rejected: {packs}")))
+            .clone();
+        (capabilities_handle.join().unwrap_or_default(), None, values)
+    };
     let pack_dir = git_dir.join("objects/pack");
     fs::create_dir_all(&pack_dir)
         .unwrap_or_else(|e| fail(format!("cannot create {}: {e}", pack_dir.display())));
-    for pack in values {
+    let mut installed_pack = false;
+    for pack in &values {
         if !pack
             .get("complete")
             .and_then(Value::as_bool)
@@ -1110,13 +1436,18 @@ fn materialize(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
             }
             continue;
         }
-        let batched_downloads = capabilities.version >= 2 && capabilities.max_download_batch_items > 1;
+        let batched_downloads =
+            capabilities.version >= 2 && capabilities.max_download_batch_items > 1;
         let calls = if batched_downloads {
             (0..count)
                 .collect::<Vec<_>>()
                 .chunks(capabilities.max_download_batch_items)
                 .map(|indexes| {
-                    let indexes = indexes.iter().map(usize::to_string).collect::<Vec<_>>().join(";");
+                    let indexes = indexes
+                        .iter()
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join(";");
                     (
                         "get_pack_chunks".into(),
                         format!("(principal \"{owner}\", \"{repo}\", \"{id}\", vec {{{indexes}}})"),
@@ -1125,10 +1456,12 @@ fn materialize(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
                 .collect()
         } else {
             (0..count)
-                .map(|index| (
-                    "get_pack_chunk".into(),
-                    format!("(principal \"{owner}\", \"{repo}\", \"{id}\", {index})"),
-                ))
+                .map(|index| {
+                    (
+                        "get_pack_chunk".into(),
+                        format!("(principal \"{owner}\", \"{repo}\", \"{id}\", {index})"),
+                    )
+                })
                 .collect()
         };
         let incoming = pack_dir.join(format!("pack-{id}.incoming-{}.pack", std::process::id()));
@@ -1146,13 +1479,25 @@ fn materialize(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
                 .unwrap_or_else(|| fail(format!("chunk download rejected: {response}")));
             if batched_downloads {
                 for chunk in data {
-                    let chunk = chunk.as_array().unwrap_or_else(|| fail("invalid chunk batch response"));
-                    let bytes = chunk.iter().map(|value| value.as_u64().unwrap() as u8).collect::<Vec<_>>();
-                    output.write_all(&bytes).unwrap_or_else(|error| fail(error.to_string()));
+                    let chunk = chunk
+                        .as_array()
+                        .unwrap_or_else(|| fail("invalid chunk batch response"));
+                    let bytes = chunk
+                        .iter()
+                        .map(|value| value.as_u64().unwrap() as u8)
+                        .collect::<Vec<_>>();
+                    output
+                        .write_all(&bytes)
+                        .unwrap_or_else(|error| fail(error.to_string()));
                 }
             } else {
-                let bytes = data.iter().map(|value| value.as_u64().unwrap() as u8).collect::<Vec<_>>();
-                output.write_all(&bytes).unwrap_or_else(|error| fail(error.to_string()));
+                let bytes = data
+                    .iter()
+                    .map(|value| value.as_u64().unwrap() as u8)
+                    .collect::<Vec<_>>();
+                output
+                    .write_all(&bytes)
+                    .unwrap_or_else(|error| fail(error.to_string()));
             }
         });
         drop(output);
@@ -1166,71 +1511,53 @@ fn materialize(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
                 .unwrap_or_else(|e| fail(format!("cannot replace {}: {e}", path.display())));
         }
         let index = path.with_extension("idx");
-        if index.exists() { let _ = fs::remove_file(&index); }
+        if index.exists() {
+            let _ = fs::remove_file(&index);
+        }
         fs::rename(&incoming, &path).unwrap_or_else(|error| fail(error.to_string()));
         fs::rename(&incoming_index, &index).unwrap_or_else(|error| fail(error.to_string()));
+        installed_pack = true;
+    }
+    if values.len() > 1 && (installed_pack || !pack_dir.join("multi-pack-index").exists()) {
+        git(git_dir, &["multi-pack-index", "write"]);
     }
     timer.mark("pack_download_and_verify");
-    let refs = icp_json(
-        canister,
-        "list_refs",
-        &format!("(principal \"{owner}\", \"{repo}\")"),
-    );
-    let remote_refs = refs
-        .get("ok")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| fail(format!("ref listing rejected: {refs}")));
-    let desired_names = remote_refs
-        .iter()
-        .filter_map(|value| value.get("name").and_then(Value::as_str))
-        .collect::<Vec<_>>();
-    for (name, _) in local_refs(git_dir) {
-        if !desired_names.contains(&name.as_str()) {
-            git(git_dir, &["update-ref", "-d", &name]);
-        }
-    }
+    let desired_refs = snapshot_refs.unwrap_or_else(|| canister_refs(canister, owner, repo));
     let mut has_main = false;
-    for value in remote_refs {
-        let name = value.get("name").and_then(Value::as_str).unwrap();
-        let oid = value.get("oid").and_then(Value::as_str).unwrap();
+    for (name, _) in &desired_refs {
         has_main |= name == "refs/heads/main";
-        git(git_dir, &["update-ref", name, oid]);
     }
+    replace_local_refs(git_dir, &desired_refs);
     if has_main {
         git(git_dir, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     }
     timer.mark("refs");
 }
 
-fn index_browse_objects(canister: &str, owner: &str, repo: &str, git_dir: &Path, object_ids: &[String]) {
+fn index_browse_objects(
+    canister: &str,
+    owner: &str,
+    repo: &str,
+    git_dir: &Path,
+    object_ids: &[String],
+) {
     let missing = missing_objects(canister, owner, repo, object_ids, true);
     let mut batch = Vec::<(String, String, Vec<u8>)>::new();
     let mut batch_bytes = 0usize;
-    let flush = |batch: &mut Vec<(String, String, Vec<u8>)>, batch_bytes: &mut usize| {
+    let mut calls = Vec::<(String, String)>::new();
+    let mut flush = |batch: &mut Vec<(String, String, Vec<u8>)>, batch_bytes: &mut usize| {
         if batch.is_empty() {
             return;
         }
         let objects = batch.iter().map(|(oid, kind, payload)| format!("record {{ oid = \"{oid}\"; git_object = record {{ kind = variant {{ \"{kind}\" }}; payload = {} }} }}", candid_blob(payload))).collect::<Vec<_>>().join(";");
-        let result = icp_json(
-            canister,
-            "put_objects_batch",
-            &format!("(principal \"{owner}\", \"{repo}\", vec {{{objects}}})"),
-        );
-        if result.get("ok").is_none() {
-            fail(format!("browse object batch rejected: {result}"))
-        }
+        calls.push((
+            "put_objects_batch".into(),
+            format!("(principal \"{owner}\", \"{repo}\", vec {{{objects}}})"),
+        ));
         batch.clear();
         *batch_bytes = 0;
     };
-    for oid in missing {
-        let kind_output = git(git_dir, &["cat-file", "-t", &oid]);
-        let kind = String::from_utf8_lossy(&kind_output.stdout)
-            .trim()
-            .to_owned();
-        if !matches!(kind.as_str(), "blob" | "tree" | "commit" | "tag") {
-            fail(format!("unsupported browse object type: {kind}"));
-        }
-        let payload = git(git_dir, &["cat-file", &kind, &oid]).stdout;
+    for (oid, kind, payload) in read_git_objects(git_dir, &missing) {
         if should_inline_object(payload.len()) {
             if batch.len() == 100 || batch_bytes + payload.len() > 1_250_000 {
                 flush(&mut batch, &mut batch_bytes)
@@ -1243,6 +1570,11 @@ fn index_browse_objects(canister: &str, owner: &str, repo: &str, git_dir: &Path,
         }
     }
     flush(&mut batch, &mut batch_bytes);
+    for result in parallel_icp_calls(canister, calls) {
+        if result.get("ok").is_none() {
+            fail(format!("browse object batch rejected: {result}"))
+        }
+    }
 }
 
 fn index_browse_object(
@@ -1328,7 +1660,7 @@ fn main() {
         "index-browse" => {
             let ids = all_object_ids(path);
             index_browse_objects(&args[2], &args[3], &args[4], path, &ids)
-        },
+        }
         _ => fail("operation must be upload, materialize, or index-browse"),
     }
 }
@@ -1354,6 +1686,42 @@ mod tests {
     fn selects_inline_and_chunked_object_boundaries() {
         assert!(should_inline_object(INLINE_OBJECT_LIMIT));
         assert!(!should_inline_object(INLINE_OBJECT_LIMIT + 1));
+    }
+    #[test]
+    fn batches_binary_git_object_reads_and_atomically_replaces_refs() {
+        let directory = tempfile::tempdir().unwrap();
+        let git_dir = directory.path().join("repository.git");
+        run(Command::new("git").args(["init", "--bare", git_dir.to_str().unwrap()]));
+        let first = directory.path().join("first.bin");
+        let second = directory.path().join("second.bin");
+        fs::write(&first, [0, b'\n', 255]).unwrap();
+        fs::write(&second, b"second\n").unwrap();
+        let first_oid = String::from_utf8_lossy(
+            &git(&git_dir, &["hash-object", "-w", first.to_str().unwrap()]).stdout,
+        )
+        .trim()
+        .to_owned();
+        let second_oid = String::from_utf8_lossy(
+            &git(&git_dir, &["hash-object", "-w", second.to_str().unwrap()]).stdout,
+        )
+        .trim()
+        .to_owned();
+        let objects = read_git_objects(&git_dir, &[first_oid.clone(), second_oid.clone()]);
+        assert_eq!(
+            objects[0],
+            (first_oid.clone(), "blob".into(), vec![0, b'\n', 255])
+        );
+        assert_eq!(
+            objects[1],
+            (second_oid.clone(), "blob".into(), b"second\n".to_vec())
+        );
+
+        replace_local_refs(&git_dir, &[("refs/tags/main".into(), first_oid.clone())]);
+        replace_local_refs(&git_dir, &[("refs/tags/next".into(), second_oid.clone())]);
+        assert_eq!(
+            local_refs(&git_dir),
+            vec![("refs/tags/next".into(), second_oid)]
+        );
     }
     #[test]
     fn emits_only_changed_ref_operations_including_deletions() {
@@ -1383,6 +1751,7 @@ mod tests {
             "begin_pack",
             "put_pack_chunk",
             "transport_capabilities",
+            "transport_snapshot",
             "put_pack_chunks",
             "finalize_pack",
             "list_pack_objects",

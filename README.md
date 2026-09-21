@@ -24,6 +24,12 @@ same binary falls back to the original endpoints without changing Git
 semantics. Set `INFINIGIT_DISABLE_TRANSPORT_V2=1` to force that compatibility
 path, or `INFINIGIT_TRANSPORT_TIMINGS=1` to print phase-level timings.
 
+Version 3 shards additionally provide one generation-aware transport snapshot.
+The helper caches unchanged manifests, shares the pre-push snapshot with the
+post-receive publisher, reads browse objects through one binary-safe Git batch
+process, pipelines independent metadata updates, refreshes refs atomically, and
+maintains Git's multi-pack index for repositories with incremental packs.
+
 ## Releases
 
 See [PUBLISHING.md](PUBLISHING.md) for registry setup, versioning, publishing,

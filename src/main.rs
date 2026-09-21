@@ -10,6 +10,7 @@ use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
 const PRODUCTION_HOST: &str = "infinigit.com";
@@ -236,11 +237,13 @@ fn run_pack(
     project_root: Option<&Path>,
     production: bool,
     password_file: Option<&Path>,
+    transport_session: &str,
 ) -> bool {
     let mut command = Command::new(pack_bridge(production));
     command
         .args([action, canister, owner, repository])
-        .arg(repo);
+        .arg(repo)
+        .env("INFINIGIT_TRANSPORT_SESSION", transport_session);
     if let Some(root) = project_root {
         command
             .current_dir(root)
@@ -278,6 +281,7 @@ fn sync_from_canister(
     project_root: Option<&Path>,
     production: bool,
     password_file: Option<&Path>,
+    transport_session: &str,
 ) {
     if !run_pack(
         "materialize",
@@ -288,6 +292,7 @@ fn sync_from_canister(
         project_root,
         production,
         password_file,
+        transport_session,
     ) {
         fail("repository not found")
     }
@@ -301,6 +306,7 @@ fn sync_to_canister(
     project_root: Option<&Path>,
     production: bool,
     password_file: Option<&Path>,
+    transport_session: &str,
 ) {
     if !run_pack(
         "upload",
@@ -311,6 +317,7 @@ fn sync_to_canister(
         project_root,
         production,
         password_file,
+        transport_session,
     ) {
         fail("canister rejected push")
     }
@@ -348,6 +355,14 @@ fn main() {
     let password_file = supplied_password_file
         .as_deref()
         .or_else(|| temporary_password_file.as_ref().map(|file| file.path()));
+    let transport_session = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
     let (owner, canister, storage_id) = if let Some(directory) = directory.as_deref() {
         let (owner, shard, storage_id) =
             resolve_repository(namespace, repository, directory, production, password_file);
@@ -384,6 +399,7 @@ fn main() {
             project_root.as_deref(),
             production,
             password_file,
+            &transport_session,
         );
     }
     if !repo.join("HEAD").is_file() {
@@ -437,6 +453,7 @@ fn main() {
                             project_root.as_deref(),
                             production,
                             password_file,
+                            &transport_session,
                         );
                     }
                 }

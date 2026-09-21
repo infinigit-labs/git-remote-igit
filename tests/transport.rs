@@ -258,7 +258,7 @@ fn username_clone_resolves_and_materializes_without_a_project_manifest() {
     let icp_log = temp.path().join("icp.log");
     fs::write(&mock_icp, "#!/usr/bin/env bash\nset -e\nprintf '%s\\n' \"$*\" >\"$INFINIGIT_TEST_ICP_LOG\"\nprintf '%s\\n' 'variant { ok = record { owner = principal \"aaaaa-aa\"; shard = principal \"rrkah-fqaaa-aaaaa-aaaaq-cai\"; storage_id = \"igit-r-1\"; visibility = variant { Public } } }'\n").unwrap();
     let mock_pack = temp.path().join("infinigit-pack");
-    fs::write(&mock_pack, "#!/usr/bin/env bash\nset -e\ntest \"$1\" = materialize\ntest \"$4\" = igit-r-1\ntest \"$PWD\" = \"$INFINIGIT_EXPECTED_WORKING_DIRECTORY\"\ntest -z \"${INFINIGIT_PROJECT_ROOT:-}\"\ntest \"$INFINIGIT_NETWORK\" = 'http://127.0.0.1:4943'\ntest \"$INFINIGIT_ROOT_KEY\" = fetch\ntest \"$INFINIGIT_IDENTITY\" = infinigit-browser\nmkdir -p \"$(dirname \"$5\")\"\ncp -R \"$INFINIGIT_TEST_SOURCE\" \"$5\"\n").unwrap();
+    fs::write(&mock_pack, "#!/usr/bin/env bash\nset -e\ntest \"$1\" = materialize\ntest \"$4\" = igit-r-1\ntest \"$PWD\" = \"$INFINIGIT_EXPECTED_WORKING_DIRECTORY\"\ntest -z \"${INFINIGIT_PROJECT_ROOT:-}\"\ntest \"$INFINIGIT_NETWORK\" = 'http://127.0.0.1:4943'\ntest \"$INFINIGIT_ROOT_KEY\" = fetch\ntest \"$INFINIGIT_IDENTITY\" = infinigit-browser\ntest -n \"$INFINIGIT_TRANSPORT_SESSION\"\nmkdir -p \"$(dirname \"$5\")\"\ncp -R \"$INFINIGIT_TEST_SOURCE\" \"$5\"\n").unwrap();
     fs::set_permissions(&mock_icp, fs::Permissions::from_mode(0o755)).unwrap();
     fs::set_permissions(&mock_pack, fs::Permissions::from_mode(0o755)).unwrap();
 
