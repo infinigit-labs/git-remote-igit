@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -20,16 +20,20 @@ use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const CHUNK_SIZE: usize = 512 * 1024;
 const INLINE_OBJECT_LIMIT: usize = 128 * 1024;
+const DEFAULT_PACK_SEGMENT_BYTES: usize = 512 * 1024 * 1024;
+const DEFAULT_CALL_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_CALL_ATTEMPTS: usize = 4;
 const PACK_DID: &str = r#"
 type Kind = variant { "blob"; "tree"; "commit"; "tag" };
 type Ref = record { name : text; oid : text };
 type Object = record { kind : Kind; payload : blob };
 type ObjectEntry = record { oid : text; git_object : Object };
 type Metadata = record { oid : text; kind : Kind; size : nat };
+type MetadataV3 = record { oid : text; kind : Kind; size : nat; offset : nat; packed_length : nat };
 type PackChunkUpload = record { index : nat; digest : text; payload : blob };
 type TransportCapabilities = record { version : nat; max_chunk_batch_items : nat; max_chunk_batch_bytes : nat; max_pack_index_batch_items : nat; max_download_batch_items : nat; max_retained_packs : nat; packed_object_reads : bool; streaming_pack_downloads : bool };
 type TransportSnapshot = record { generation : text; unchanged : bool; refs : vec Ref; packs : vec Pack; capabilities : TransportCapabilities };
@@ -62,6 +66,7 @@ service : {
   list_pack_objects : (principal, text, text) -> (ResultTexts) query;
   index_pack_objects_batch : (principal, text, text, vec Metadata, bool) -> (ResultNat);
   index_pack_objects_batch_v2 : (principal, text, text, vec Metadata, bool) -> (ResultNat);
+  index_pack_objects_batch_v3 : (principal, text, text, vec MetadataV3, bool) -> (ResultNat);
   put_objects_batch : (principal, text, vec ObjectEntry) -> (ResultTexts);
   update_refs_atomic : (principal, text, vec RefChange) -> (ResultRefs);
   stage_ref_transaction_page : (principal, text, text, nat, nat, vec RefChange) -> (ResultRefTransaction);
@@ -93,7 +98,7 @@ struct TransportCapabilities {
     max_pack_index_batch_items: usize,
     max_download_batch_items: usize,
     max_retained_packs: usize,
-    _packed_object_reads: bool,
+    packed_object_reads: bool,
     _streaming_pack_downloads: bool,
 }
 
@@ -114,7 +119,7 @@ impl Default for TransportCapabilities {
             max_pack_index_batch_items: 500,
             max_download_batch_items: 1,
             max_retained_packs: 100,
-            _packed_object_reads: false,
+            packed_object_reads: false,
             _streaming_pack_downloads: false,
         }
     }
@@ -147,6 +152,61 @@ impl TransportTimer {
                 now.duration_since(self.started).as_millis()
             );
             self.checkpoint = now;
+        }
+    }
+}
+
+struct TransferProgress {
+    label: &'static str,
+    unit: &'static str,
+    completed: u64,
+    total: u64,
+    started: Instant,
+    last_reported: Instant,
+}
+
+impl TransferProgress {
+    fn new(label: &'static str, unit: &'static str, total: u64, completed: u64) -> Self {
+        let now = Instant::now();
+        let progress = Self {
+            label,
+            unit,
+            completed,
+            total,
+            started: now,
+            last_reported: now,
+        };
+        progress.print();
+        progress
+    }
+
+    fn advance(&mut self, amount: u64) {
+        self.completed = self.completed.saturating_add(amount).min(self.total);
+        if self.completed == self.total || self.last_reported.elapsed() >= Duration::from_secs(2) {
+            self.print();
+            self.last_reported = Instant::now();
+        }
+    }
+
+    fn print(&self) {
+        let percent = if self.total == 0 {
+            100.0
+        } else {
+            self.completed as f64 * 100.0 / self.total as f64
+        };
+        let elapsed = self.started.elapsed().as_secs_f64().max(0.001);
+        if self.unit == "bytes" {
+            let rate = self.completed as f64 / elapsed / (1024.0 * 1024.0);
+            eprintln!(
+                "infinigit: {} {}/{} bytes ({percent:.1}%, {rate:.1} MiB/s)",
+                self.label, self.completed, self.total
+            );
+        } else {
+            let rate = self.completed as f64 / elapsed;
+            eprintln!(
+                "infinigit: {} {}/{} {} ({percent:.1}%, {rate:.1}/s)",
+                self.label, self.completed, self.total, self.unit
+            );
         }
     }
 }
@@ -259,7 +319,7 @@ fn canister_principal(client: &AgentClient, canister: &str) -> Result<Principal,
     Ok(principal)
 }
 
-fn agent_json(
+fn agent_json_attempt(
     client: &AgentClient,
     canister: &str,
     method: &str,
@@ -281,22 +341,36 @@ fn agent_json(
         .to_bytes_with_types(&type_env, &signature.args)
         .map_err(|error| error.to_string())?;
     let principal = canister_principal(client, canister)?;
+    let timeout = Duration::from_secs(
+        env::var("INFINIGIT_CALL_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_CALL_TIMEOUT_SECS),
+    );
     let bytes = if signature.is_query() {
-        client
-            .runtime
-            .block_on(client.agent.query(&principal, method).with_arg(args).call())
-            .map_err(|error| error.to_string())?
+        client.runtime.block_on(async {
+            tokio::time::timeout(
+                timeout,
+                client.agent.query(&principal, method).with_arg(args).call(),
+            )
+            .await
+            .map_err(|_| format!("{method} timed out after {} seconds", timeout.as_secs()))?
+            .map_err(|error| error.to_string())
+        })?
     } else {
-        client
-            .runtime
-            .block_on(
+        client.runtime.block_on(async {
+            tokio::time::timeout(
+                timeout,
                 client
                     .agent
                     .update(&principal, method)
                     .with_arg(args)
                     .call_and_wait(),
             )
-            .map_err(|error| error.to_string())?
+            .await
+            .map_err(|_| format!("{method} timed out after {} seconds", timeout.as_secs()))?
+            .map_err(|error| error.to_string())
+        })?
     };
     let decoded = IDLArgs::from_bytes_with_types(&bytes, &type_env, &signature.rets)
         .map_err(|error| error.to_string())?;
@@ -306,6 +380,68 @@ fn agent_json(
         .next()
         .map(idl_json)
         .unwrap_or(Value::Null))
+}
+
+fn retryable_method(method: &str) -> bool {
+    matches!(
+        method,
+        "transport_capabilities"
+            | "transport_snapshot"
+            | "list_refs"
+            | "list_packs"
+            | "missing_objects"
+            | "begin_pack"
+            | "put_pack_chunk"
+            | "put_pack_chunks"
+            | "finalize_pack"
+            | "list_pack_objects"
+            | "index_pack_objects_batch"
+            | "index_pack_objects_batch_v2"
+            | "index_pack_objects_batch_v3"
+            | "put_objects_batch"
+            | "begin_chunked_object"
+            | "put_object_chunk"
+            | "finalize_chunked_object"
+            | "get_pack_chunk"
+            | "get_pack_chunks"
+    )
+}
+
+fn agent_json(
+    client: &AgentClient,
+    canister: &str,
+    method: &str,
+    argument: &str,
+) -> Result<Value, String> {
+    let attempts = if retryable_method(method) {
+        env::var("INFINIGIT_CALL_ATTEMPTS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_CALL_ATTEMPTS)
+            .clamp(1, 10)
+    } else {
+        1
+    };
+    let mut last_error = String::new();
+    for attempt in 1..=attempts {
+        match agent_json_attempt(client, canister, method, argument) {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                last_error = error;
+                if attempt < attempts {
+                    let delay = Duration::from_millis(250u64.saturating_mul(1 << (attempt - 1)));
+                    eprintln!(
+                        "infinigit: {method} attempt {attempt}/{attempts} failed; retrying in {} ms: {last_error}",
+                        delay.as_millis()
+                    );
+                    std::thread::sleep(delay);
+                }
+            }
+        }
+    }
+    Err(format!(
+        "{method} failed after {attempts} attempts: {last_error}"
+    ))
 }
 
 fn fail(message: impl AsRef<str>) -> ! {
@@ -446,7 +582,7 @@ fn capabilities_from_value(value: &Value) -> TransportCapabilities {
         max_retained_packs: json_usize(&value, "max_retained_packs")
             .unwrap_or(100)
             .clamp(100, 1_000),
-        _packed_object_reads: value
+        packed_object_reads: value
             .get("packed_object_reads")
             .and_then(Value::as_bool)
             .unwrap_or(false),
@@ -636,6 +772,30 @@ fn parallel_icp_calls(canister: &str, calls: Vec<(String, String)>) -> Vec<Value
     results
 }
 
+fn for_bounded_icp_calls<I>(canister: &str, calls: I, mut consume: impl FnMut(Value))
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let automatic = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .saturating_mul(2)
+        .clamp(4, 12);
+    let concurrency = env::var("INFINIGIT_UPLOAD_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(automatic)
+        .clamp(1, 16);
+    let mut calls = calls.into_iter();
+    loop {
+        let group = calls.by_ref().take(concurrency).collect::<Vec<_>>();
+        if group.is_empty() {
+            break;
+        }
+        for_parallel_icp_calls(canister, group, &mut consume);
+    }
+}
+
 fn label_text(label: Label) -> String {
     match label {
         Label::Named(name) => name,
@@ -710,9 +870,13 @@ fn git(git_dir: &Path, args: &[&str]) -> Output {
     run(Command::new("git").arg("--git-dir").arg(git_dir).args(args))
 }
 
-fn read_git_objects(git_dir: &Path, ids: &[String]) -> Vec<(String, String, Vec<u8>)> {
+fn for_each_git_object(
+    git_dir: &Path,
+    ids: &[String],
+    mut consume: impl FnMut(String, String, Vec<u8>),
+) {
     if ids.is_empty() {
-        return Vec::new();
+        return;
     }
     let mut child = Command::new("git")
         .arg("--git-dir")
@@ -731,7 +895,6 @@ fn read_git_objects(git_dir: &Path, ids: &[String]) -> Vec<(String, String, Vec<
     }
     drop(child.stdin.take());
     let mut output = BufReader::new(child.stdout.take().unwrap());
-    let mut objects = Vec::with_capacity(ids.len());
     for expected_oid in ids {
         let mut header = String::new();
         output
@@ -761,7 +924,7 @@ fn read_git_objects(git_dir: &Path, ids: &[String]) -> Vec<(String, String, Vec<
         if terminator != [b'\n'] {
             fail("invalid git cat-file object terminator");
         }
-        objects.push((expected_oid.clone(), kind, payload));
+        consume(expected_oid.clone(), kind, payload);
     }
     let status = child
         .wait()
@@ -769,9 +932,53 @@ fn read_git_objects(git_dir: &Path, ids: &[String]) -> Vec<(String, String, Vec<
     if !status.success() {
         fail("git cat-file batch failed");
     }
+}
+
+#[cfg(test)]
+fn read_git_objects(git_dir: &Path, ids: &[String]) -> Vec<(String, String, Vec<u8>)> {
+    let mut objects = Vec::with_capacity(ids.len());
+    for_each_git_object(git_dir, ids, |oid, kind, payload| {
+        objects.push((oid, kind, payload))
+    });
     objects
 }
 
+fn non_blob_object_ids(git_dir: &Path, ids: &[String]) -> Vec<String> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let mut child = Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["cat-file", "--batch-check=%(objectname) %(objecttype)"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap_or_else(|error| fail(format!("cannot start git cat-file batch-check: {error}")));
+    {
+        let input = child.stdin.as_mut().unwrap();
+        for oid in ids {
+            writeln!(input, "{oid}").unwrap_or_else(|error| fail(error.to_string()));
+        }
+    }
+    drop(child.stdin.take());
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|error| fail(error.to_string()));
+    if !output.status.success() {
+        fail("git cat-file batch-check failed");
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (oid, kind) = line.split_once(' ')?;
+            (kind != "blob").then(|| oid.to_owned())
+        })
+        .collect()
+}
+
+#[cfg(test)]
 fn pack_id(bytes: &[u8]) -> String {
     assert!(bytes.len() >= 20);
     bytes[bytes.len() - 20..]
@@ -801,6 +1008,37 @@ struct PackObjectMetadata {
     oid: String,
     kind: String,
     size: u64,
+    offset: u64,
+    packed_length: u64,
+}
+
+fn pack_index_call(
+    capabilities: &TransportCapabilities,
+    owner: &str,
+    repo: &str,
+    pack_id: &str,
+    batch: &[&PackObjectMetadata],
+    reset: bool,
+) -> (String, String) {
+    let objects = batch
+        .iter()
+        .map(|object| if capabilities.version >= 4 {
+            format!("record {{ oid = \"{}\"; kind = variant {{ \"{}\" }}; size = {}; offset = {}; packed_length = {} }}", object.oid, object.kind, object.size, object.offset, object.packed_length)
+        } else {
+            format!("record {{ oid = \"{}\"; kind = variant {{ \"{}\" }}; size = {} }}", object.oid, object.kind, object.size)
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    (
+        if capabilities.version >= 4 {
+            "index_pack_objects_batch_v3".into()
+        } else if capabilities.version >= 2 {
+            "index_pack_objects_batch_v2".into()
+        } else {
+            "index_pack_objects_batch".into()
+        },
+        format!("(principal \"{owner}\", \"{repo}\", \"{pack_id}\", vec {{{objects}}}, {reset})"),
+    )
 }
 
 fn pack_object_metadata(git_dir: &Path, index: &Path) -> Vec<PackObjectMetadata> {
@@ -812,6 +1050,8 @@ fn pack_object_metadata(git_dir: &Path, index: &Path) -> Vec<PackObjectMetadata>
             let oid = *fields.first()?;
             let kind = *fields.get(1)?;
             let size = fields.get(2)?.parse::<u64>().ok()?;
+            let packed_length = fields.get(3)?.parse::<u64>().ok()?;
+            let offset = fields.get(4)?.parse::<u64>().ok()?;
             (oid.len() == 40
                 && oid.bytes().all(|c| c.is_ascii_hexdigit())
                 && matches!(kind, "blob" | "tree" | "commit" | "tag"))
@@ -819,6 +1059,8 @@ fn pack_object_metadata(git_dir: &Path, index: &Path) -> Vec<PackObjectMetadata>
                 oid: oid.to_owned(),
                 kind: kind.to_owned(),
                 size,
+                offset,
+                packed_length,
             })
         })
         .collect()
@@ -1013,9 +1255,17 @@ fn missing_objects(
     missing
 }
 
-fn create_incremental_pack(git_dir: &Path, ids: &[String]) -> Option<String> {
+fn pack_segment_bytes() -> usize {
+    env::var("INFINIGIT_MAX_PACK_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_PACK_SEGMENT_BYTES)
+        .max(1024 * 1024)
+}
+
+fn create_incremental_packs(git_dir: &Path, ids: &[String]) -> Vec<String> {
     if ids.is_empty() {
-        return None;
+        return Vec::new();
     }
     let pack_dir = git_dir.join("objects/pack");
     fs::create_dir_all(&pack_dir).unwrap_or_else(|error| fail(error.to_string()));
@@ -1023,7 +1273,13 @@ fn create_incremental_pack(git_dir: &Path, ids: &[String]) -> Option<String> {
     let mut child = Command::new("git")
         .arg("--git-dir")
         .arg(git_dir)
-        .args(["pack-objects", base.to_str().unwrap()])
+        .args([
+            "pack-objects",
+            "--no-reuse-delta",
+            "--window=0",
+            &format!("--max-pack-size={}", pack_segment_bytes()),
+            base.to_str().unwrap(),
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -1041,11 +1297,20 @@ fn create_incremental_pack(git_dir: &Path, ids: &[String]) -> Option<String> {
     if !output.status.success() {
         fail("git pack-objects failed")
     }
-    let id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if id.len() != 40 {
+    let ids = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if ids.is_empty()
+        || ids
+            .iter()
+            .any(|id| id.len() != 40 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
         fail("git pack-objects returned an invalid pack id")
     }
-    Some(id)
+    ids
 }
 
 fn canister_packs(canister: &str, owner: &str, repo: &str) -> BTreeMap<String, usize> {
@@ -1066,6 +1331,122 @@ fn canister_packs(canister: &str, owner: &str, repo: &str) -> BTreeMap<String, u
             ))
         })
         .collect()
+}
+
+fn uploaded_chunk_indexes(begin: &Value) -> BTreeSet<usize> {
+    begin
+        .get("ok")
+        .and_then(|value| value.get("uploaded_chunks"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| {
+            value
+                .as_u64()
+                .map(|number| number as usize)
+                .or_else(|| value.as_str()?.replace('_', "").parse().ok())
+        })
+        .collect()
+}
+
+fn pending_chunk_indexes(chunk_count: usize, uploaded: &BTreeSet<usize>) -> Vec<usize> {
+    (0..chunk_count)
+        .filter(|index| !uploaded.contains(index))
+        .collect()
+}
+
+fn upload_pack_chunks(
+    canister: &str,
+    owner: &str,
+    repo: &str,
+    pack_id: &str,
+    path: &Path,
+    capabilities: &TransportCapabilities,
+    uploaded: &BTreeSet<usize>,
+) {
+    let total = fs::metadata(path)
+        .unwrap_or_else(|error| fail(error.to_string()))
+        .len();
+    let chunk_count = total.div_ceil(CHUNK_SIZE as u64) as usize;
+    let acknowledged = uploaded
+        .iter()
+        .filter(|index| **index < chunk_count)
+        .map(|index| (total - (*index as u64 * CHUNK_SIZE as u64)).min(CHUNK_SIZE as u64))
+        .sum();
+    let mut progress = TransferProgress::new("uploading pack", "bytes", total, acknowledged);
+    let pending = pending_chunk_indexes(chunk_count, uploaded);
+    let concurrency = env::var("INFINIGIT_UPLOAD_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(4)
+                .saturating_mul(2)
+        })
+        .clamp(1, 16);
+    let mut cursor = 0;
+    let mut file = File::open(path).unwrap_or_else(|error| fail(error.to_string()));
+    while cursor < pending.len() {
+        let mut group = Vec::<(String, String, u64)>::new();
+        while group.len() < concurrency && cursor < pending.len() {
+            let mut uploads = Vec::new();
+            let mut request_bytes = 0usize;
+            while cursor < pending.len() && uploads.len() < capabilities.max_chunk_batch_items {
+                let index = pending[cursor];
+                let length =
+                    ((total - index as u64 * CHUNK_SIZE as u64).min(CHUNK_SIZE as u64)) as usize;
+                if !uploads.is_empty()
+                    && request_bytes + length > capabilities.max_chunk_batch_bytes
+                {
+                    break;
+                }
+                let mut bytes = vec![0; length];
+                file.seek(SeekFrom::Start(index as u64 * CHUNK_SIZE as u64))
+                    .and_then(|_| file.read_exact(&mut bytes))
+                    .unwrap_or_else(|error| {
+                        fail(format!("cannot read pack chunk {index}: {error}"))
+                    });
+                let digest = format!("{:x}", Sha256::digest(&bytes));
+                uploads.push((index, digest, bytes));
+                request_bytes += length;
+                cursor += 1;
+            }
+            let bytes = request_bytes as u64;
+            if capabilities.version >= 2 && capabilities.max_chunk_batch_items > 1 {
+                let values = uploads
+                    .iter()
+                    .map(|(index, digest, payload)| {
+                        format!(
+                            "record {{ index = {index}; digest = \"{digest}\"; payload = {} }}",
+                            candid_blob(payload)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(";");
+                group.push((
+                    "put_pack_chunks".into(),
+                    format!("(principal \"{owner}\", \"{repo}\", \"{pack_id}\", vec {{{values}}})"),
+                    bytes,
+                ));
+            } else {
+                let (index, digest, payload) = uploads.pop().expect("one pending chunk");
+                group.push(("put_pack_chunk".into(), format!("(principal \"{owner}\", \"{repo}\", \"{pack_id}\", {index}, \"{digest}\", {})", candid_blob(&payload)), bytes));
+            }
+        }
+        let byte_counts = group.iter().map(|entry| entry.2).collect::<Vec<_>>();
+        let calls = group
+            .into_iter()
+            .map(|(method, argument, _)| (method, argument))
+            .collect();
+        let results = parallel_icp_calls(canister, calls);
+        for (result, bytes) in results.into_iter().zip(byte_counts) {
+            if result.get("ok").is_none() {
+                fail(format!("chunk upload rejected: {result}"));
+            }
+            progress.advance(bytes);
+        }
+    }
 }
 
 fn candid_ref_changes(expected: &[(String, String)], desired: &[(String, String)]) -> Vec<String> {
@@ -1182,10 +1563,10 @@ fn upload(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
                 .filter_map(Result::ok)
                 .map(|entry| entry.path())
                 .filter(|path| path.extension().is_some_and(|value| value == "pack"))
-                .map(|path| pack_id(&fs::read(path).unwrap())),
+                .map(|path| pack_id_from_file(&path).unwrap_or_else(|error| fail(error))),
         );
-    } else if let Some(id) = create_incremental_pack(git_dir, &missing) {
-        desired_pack_ids.push(id)
+    } else {
+        desired_pack_ids.extend(create_incremental_packs(git_dir, &missing))
     }
     desired_pack_ids.sort();
     desired_pack_ids.dedup();
@@ -1201,8 +1582,10 @@ fn upload(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
             continue;
         }
         let objects = pack_object_metadata(git_dir, &index);
-        let bytes = fs::read(&path).unwrap_or_else(|e| fail(e.to_string()));
-        if pack_id(&bytes) != id {
+        let total_size = fs::metadata(&path)
+            .unwrap_or_else(|error| fail(error.to_string()))
+            .len();
+        if pack_id_from_file(&path).as_deref() != Ok(id.as_str()) {
             fail(format!("local pack checksum mismatch: {id}"))
         }
         let begin = icp_json(
@@ -1210,7 +1593,7 @@ fn upload(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
             "begin_pack",
             &format!(
                 "(principal \"{owner}\", \"{repo}\", \"{id}\", {}, {CHUNK_SIZE})",
-                bytes.len()
+                total_size
             ),
         );
         let complete = begin
@@ -1219,61 +1602,15 @@ fn upload(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if !complete {
-            let chunks = bytes
-                .chunks(CHUNK_SIZE)
-                .enumerate()
-                .map(|(index, chunk)| (index, format!("{:x}", Sha256::digest(chunk)), chunk))
-                .collect::<Vec<_>>();
-            let calls = if capabilities.version >= 2 && capabilities.max_chunk_batch_items > 1 {
-                let mut calls = Vec::new();
-                let mut cursor = 0;
-                while cursor < chunks.len() {
-                    let mut end = cursor;
-                    let mut size = 0;
-                    while end < chunks.len()
-                        && end - cursor < capabilities.max_chunk_batch_items
-                        && size + chunks[end].2.len() <= capabilities.max_chunk_batch_bytes
-                    {
-                        size += chunks[end].2.len();
-                        end += 1;
-                    }
-                    if end == cursor {
-                        end += 1;
-                    }
-                    let uploads = chunks[cursor..end]
-                        .iter()
-                        .map(|(index, digest, chunk)| {
-                            format!(
-                                "record {{ index = {index}; digest = \"{digest}\"; payload = {} }}",
-                                candid_blob(chunk)
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join(";");
-                    calls.push((
-                        "put_pack_chunks".into(),
-                        format!("(principal \"{owner}\", \"{repo}\", \"{id}\", vec {{{uploads}}})"),
-                    ));
-                    cursor = end;
-                }
-                calls
-            } else {
-                chunks
-                    .iter()
-                    .map(|(index, digest, chunk)| (
-                        "put_pack_chunk".into(),
-                        format!(
-                            "(principal \"{owner}\", \"{repo}\", \"{id}\", {index}, \"{digest}\", {})",
-                            candid_blob(chunk)
-                        ),
-                    ))
-                    .collect()
-            };
-            for result in parallel_icp_calls(canister, calls) {
-                if result.get("ok").is_none() {
-                    fail(format!("chunk upload rejected: {result}"));
-                }
-            }
+            upload_pack_chunks(
+                canister,
+                owner,
+                repo,
+                &id,
+                &path,
+                &capabilities,
+                &uploaded_chunk_indexes(&begin),
+            );
             let result = icp_json(
                 canister,
                 "finalize_pack",
@@ -1303,48 +1640,29 @@ fn upload(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
             .filter(|object| !already.contains(object.oid.as_str()))
             .collect::<Vec<_>>();
         let index_batch_size = capabilities.max_pack_index_batch_items;
-        let mut index_calls = Vec::<(String, String)>::new();
-        for (batch_index, batch) in pending.chunks(index_batch_size).enumerate() {
-            let candid_objects = batch
-                .iter()
-                .map(|object| {
-                    format!(
-                        "record {{ oid = \"{}\"; kind = variant {{ \"{}\" }}; size = {} }}",
-                        object.oid, object.kind, object.size
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(";");
-            index_calls.push((
-                if capabilities.version >= 2 {
-                    "index_pack_objects_batch_v2".into()
-                } else {
-                    "index_pack_objects_batch".into()
-                },
-                format!(
-                    "(principal \"{owner}\", \"{repo}\", \"{id}\", vec {{{candid_objects}}}, {})",
-                    already.is_empty() && batch_index == 0
-                ),
-            ));
-        }
-        if capabilities.version >= 2 && already.is_empty() && !index_calls.is_empty() {
-            let (method, argument) = index_calls.remove(0);
+        let mut batches = pending.chunks(index_batch_size);
+        if capabilities.version >= 2 && already.is_empty() && !pending.is_empty() {
+            let first = batches.next().unwrap_or(&[]);
+            let (method, argument) = pack_index_call(&capabilities, owner, repo, &id, first, true);
             let indexed = icp_json(canister, &method, &argument);
             if indexed.get("ok").is_none() {
                 fail(format!("pack index batch rejected: {indexed}"));
             }
         }
-        let indexed = if capabilities.version >= 2 {
-            parallel_icp_calls(canister, index_calls)
+        let remaining =
+            batches.map(|batch| pack_index_call(&capabilities, owner, repo, &id, batch, false));
+        if capabilities.version >= 2 {
+            for_bounded_icp_calls(canister, remaining, |result| {
+                if result.get("ok").is_none() {
+                    fail(format!("pack index batch rejected: {result}"));
+                }
+            });
         } else {
-            index_calls
-                .into_iter()
-                .map(|(method, argument)| icp_json(canister, &method, &argument))
-                .collect()
-        };
-        for result in indexed {
-            if result.get("ok").is_none() {
-                fail(format!("pack index batch rejected: {result}"));
+            for (method, argument) in remaining {
+                let result = icp_json(canister, &method, &argument);
+                if result.get("ok").is_none() {
+                    fail(format!("pack index batch rejected: {result}"));
+                }
             }
         }
     }
@@ -1353,7 +1671,12 @@ fn upload(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
     // Browser repository views read canonical loose objects through get_object.
     // Publish those objects before moving refs so a newly visible commit can
     // never point at a tree/blob that the browser cannot load.
-    index_browse_objects(canister, owner, repo, git_dir, &candidates);
+    let browse_candidates = if capabilities.packed_object_reads {
+        non_blob_object_ids(git_dir, &candidates)
+    } else {
+        candidates.clone()
+    };
+    index_browse_objects(canister, owner, repo, git_dir, &browse_candidates);
     timer.mark("browse_objects");
 
     publish_ref_changes(canister, owner, repo, &changes);
@@ -1545,7 +1868,24 @@ fn index_browse_objects(
     let mut batch = Vec::<(String, String, Vec<u8>)>::new();
     let mut batch_bytes = 0usize;
     let mut calls = Vec::<(String, String)>::new();
-    let mut flush = |batch: &mut Vec<(String, String, Vec<u8>)>, batch_bytes: &mut usize| {
+    let concurrency = env::var("INFINIGIT_UPLOAD_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(8)
+        .clamp(1, 16);
+    let flush_calls = |calls: &mut Vec<(String, String)>| {
+        if calls.is_empty() {
+            return;
+        }
+        for result in parallel_icp_calls(canister, std::mem::take(calls)) {
+            if result.get("ok").is_none() {
+                fail(format!("browse object batch rejected: {result}"));
+            }
+        }
+    };
+    let flush = |batch: &mut Vec<(String, String, Vec<u8>)>,
+                 batch_bytes: &mut usize,
+                 calls: &mut Vec<(String, String)>| {
         if batch.is_empty() {
             return;
         }
@@ -1557,24 +1897,34 @@ fn index_browse_objects(
         batch.clear();
         *batch_bytes = 0;
     };
-    for (oid, kind, payload) in read_git_objects(git_dir, &missing) {
+    let mut completed = 0u64;
+    let mut progress = TransferProgress::new(
+        "publishing browser objects",
+        "objects",
+        missing.len() as u64,
+        0,
+    );
+    for_each_git_object(git_dir, &missing, |oid, kind, payload| {
         if should_inline_object(payload.len()) {
             if batch.len() == 100 || batch_bytes + payload.len() > 1_250_000 {
-                flush(&mut batch, &mut batch_bytes)
+                flush(&mut batch, &mut batch_bytes, &mut calls)
             }
             batch_bytes += payload.len();
             batch.push((oid, kind, payload));
         } else {
-            flush(&mut batch, &mut batch_bytes);
+            flush(&mut batch, &mut batch_bytes, &mut calls);
+            flush_calls(&mut calls);
             index_browse_object(canister, owner, repo, &oid, &kind, &payload);
         }
-    }
-    flush(&mut batch, &mut batch_bytes);
-    for result in parallel_icp_calls(canister, calls) {
-        if result.get("ok").is_none() {
-            fail(format!("browse object batch rejected: {result}"))
+        completed += 1;
+        progress.advance(1);
+        if calls.len() >= concurrency {
+            flush_calls(&mut calls);
         }
-    }
+    });
+    flush(&mut batch, &mut batch_bytes, &mut calls);
+    flush_calls(&mut calls);
+    debug_assert_eq!(completed, missing.len() as u64);
 }
 
 fn index_browse_object(
@@ -1627,13 +1977,12 @@ fn index_browse_object(
                     candid_blob(chunk)
                 ),
             )
-        })
-        .collect::<Vec<_>>();
-    for result in parallel_icp_calls(canister, calls) {
+        });
+    for_bounded_icp_calls(canister, calls, |result| {
         if result.get("ok").is_none() {
             fail(format!("browse object chunk upload rejected: {result}"));
         }
-    }
+    });
     let finalized = icp_json(
         canister,
         "finalize_chunked_object",
@@ -1757,6 +2106,7 @@ mod tests {
             "list_pack_objects",
             "index_pack_objects_batch",
             "index_pack_objects_batch_v2",
+            "index_pack_objects_batch_v3",
             "put_objects_batch",
             "update_refs_atomic",
             "stage_ref_transaction_page",
@@ -1771,5 +2121,105 @@ mod tests {
         ] {
             assert!(env.get_method(&actor, method).is_ok(), "missing {method}");
         }
+    }
+
+    #[test]
+    fn resumes_only_unacknowledged_pack_chunks() {
+        let receipt = serde_json::json!({
+            "ok": { "uploaded_chunks": ["0", 2, "4_000"] }
+        });
+        assert_eq!(
+            uploaded_chunk_indexes(&receipt),
+            BTreeSet::from([0, 2, 4_000])
+        );
+        assert_eq!(
+            pending_chunk_indexes(5, &BTreeSet::from([0, 2, 4_000])),
+            vec![1, 3, 4]
+        );
+        assert!(uploaded_chunk_indexes(&serde_json::json!({"err": "missing"})).is_empty());
+    }
+
+    #[test]
+    fn retries_only_idempotent_transport_operations() {
+        for method in [
+            "begin_pack",
+            "put_pack_chunks",
+            "finalize_pack",
+            "index_pack_objects_batch_v3",
+            "put_objects_batch",
+            "get_pack_chunks",
+        ] {
+            assert!(retryable_method(method), "{method} should be retryable");
+        }
+        for method in [
+            "update_refs_atomic",
+            "stage_ref_transaction_page",
+            "commit_ref_transaction",
+            "abort_ref_transaction",
+        ] {
+            assert!(
+                !retryable_method(method),
+                "{method} must not be blindly retried"
+            );
+        }
+    }
+
+    #[test]
+    fn v4_pack_indexes_include_verified_ranges_while_old_shards_stay_compatible() {
+        let object = PackObjectMetadata {
+            oid: "ab".repeat(20),
+            kind: "blob".into(),
+            size: 42,
+            offset: 123,
+            packed_length: 17,
+        };
+        let mut capabilities = TransportCapabilities::default();
+        capabilities.version = 4;
+        let (method, argument) = pack_index_call(
+            &capabilities,
+            "aaaaa-aa",
+            "repo",
+            &"cd".repeat(20),
+            &[&object],
+            true,
+        );
+        assert_eq!(method, "index_pack_objects_batch_v3");
+        assert!(argument.contains("offset = 123"));
+        assert!(argument.contains("packed_length = 17"));
+
+        capabilities.version = 2;
+        let (method, argument) = pack_index_call(
+            &capabilities,
+            "aaaaa-aa",
+            "repo",
+            &"cd".repeat(20),
+            &[&object],
+            false,
+        );
+        assert_eq!(method, "index_pack_objects_batch_v2");
+        assert!(!argument.contains("packed_length"));
+
+        capabilities.version = 1;
+        assert_eq!(
+            pack_index_call(
+                &capabilities,
+                "aaaaa-aa",
+                "repo",
+                &"cd".repeat(20),
+                &[&object],
+                false,
+            )
+            .0,
+            "index_pack_objects_batch"
+        );
+    }
+
+    #[test]
+    fn progress_is_bounded_and_accounts_for_resumed_bytes() {
+        let mut progress = TransferProgress::new("test", "bytes", 100, 60);
+        progress.advance(25);
+        assert_eq!(progress.completed, 85);
+        progress.advance(100);
+        assert_eq!(progress.completed, 100);
     }
 }
