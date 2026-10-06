@@ -887,45 +887,51 @@ fn for_each_git_object(
         .stderr(Stdio::inherit())
         .spawn()
         .unwrap_or_else(|error| fail(format!("cannot start git cat-file batch: {error}")));
-    {
-        let input = child.stdin.as_mut().unwrap();
-        for oid in ids {
-            writeln!(input, "{oid}").unwrap_or_else(|error| fail(error.to_string()));
-        }
-    }
-    drop(child.stdin.take());
+    let mut input = child.stdin.take().unwrap();
     let mut output = BufReader::new(child.stdout.take().unwrap());
-    for expected_oid in ids {
-        let mut header = String::new();
-        output
-            .read_line(&mut header)
-            .unwrap_or_else(|error| fail(format!("cannot read git cat-file header: {error}")));
-        let fields = header.split_whitespace().collect::<Vec<_>>();
-        if fields.len() != 3 || fields[0] != expected_oid || fields[1] == "missing" {
-            fail(format!(
-                "invalid git cat-file response for {expected_oid}: {header}"
-            ));
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(move || -> std::io::Result<()> {
+            for oid in ids {
+                writeln!(input, "{oid}")?;
+            }
+            Ok(())
+        });
+        for expected_oid in ids {
+            let mut header = String::new();
+            output
+                .read_line(&mut header)
+                .unwrap_or_else(|error| fail(format!("cannot read git cat-file header: {error}")));
+            let fields = header.split_whitespace().collect::<Vec<_>>();
+            if fields.len() != 3 || fields[0] != expected_oid || fields[1] == "missing" {
+                fail(format!(
+                    "invalid git cat-file response for {expected_oid}: {header}"
+                ));
+            }
+            let kind = fields[1].to_owned();
+            if !matches!(kind.as_str(), "blob" | "tree" | "commit" | "tag") {
+                fail(format!("unsupported browse object type: {kind}"));
+            }
+            let size = fields[2]
+                .parse::<usize>()
+                .unwrap_or_else(|_| fail(format!("invalid git object size: {}", fields[2])));
+            let mut payload = vec![0; size];
+            output
+                .read_exact(&mut payload)
+                .unwrap_or_else(|error| fail(format!("cannot read git object: {error}")));
+            let mut terminator = [0];
+            output.read_exact(&mut terminator).unwrap_or_else(|error| {
+                fail(format!("cannot read git object terminator: {error}"))
+            });
+            if terminator != [b'\n'] {
+                fail("invalid git cat-file object terminator");
+            }
+            consume(expected_oid.clone(), kind, payload);
         }
-        let kind = fields[1].to_owned();
-        if !matches!(kind.as_str(), "blob" | "tree" | "commit" | "tag") {
-            fail(format!("unsupported browse object type: {kind}"));
-        }
-        let size = fields[2]
-            .parse::<usize>()
-            .unwrap_or_else(|_| fail(format!("invalid git object size: {}", fields[2])));
-        let mut payload = vec![0; size];
-        output
-            .read_exact(&mut payload)
-            .unwrap_or_else(|error| fail(format!("cannot read git object: {error}")));
-        let mut terminator = [0];
-        output
-            .read_exact(&mut terminator)
-            .unwrap_or_else(|error| fail(format!("cannot read git object terminator: {error}")));
-        if terminator != [b'\n'] {
-            fail("invalid git cat-file object terminator");
-        }
-        consume(expected_oid.clone(), kind, payload);
-    }
+        writer
+            .join()
+            .unwrap_or_else(|_| fail("git cat-file input writer panicked"))
+            .unwrap_or_else(|error| fail(format!("cannot write git cat-file input: {error}")));
+    });
     let status = child
         .wait()
         .unwrap_or_else(|error| fail(format!("cannot wait for git cat-file batch: {error}")));
@@ -956,26 +962,41 @@ fn non_blob_object_ids(git_dir: &Path, ids: &[String]) -> Vec<String> {
         .stderr(Stdio::inherit())
         .spawn()
         .unwrap_or_else(|error| fail(format!("cannot start git cat-file batch-check: {error}")));
-    {
-        let input = child.stdin.as_mut().unwrap();
-        for oid in ids {
-            writeln!(input, "{oid}").unwrap_or_else(|error| fail(error.to_string()));
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let mut result = Vec::new();
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(move || -> std::io::Result<()> {
+            for oid in ids {
+                writeln!(input, "{oid}")?;
+            }
+            Ok(())
+        });
+        for _ in ids {
+            let mut line = String::new();
+            output.read_line(&mut line).unwrap_or_else(|error| {
+                fail(format!("cannot read git batch-check output: {error}"))
+            });
+            let (oid, kind) = line
+                .trim_end()
+                .split_once(' ')
+                .unwrap_or_else(|| fail(format!("invalid git batch-check response: {line}")));
+            if kind != "blob" {
+                result.push(oid.to_owned());
+            }
         }
-    }
-    drop(child.stdin.take());
-    let output = child
-        .wait_with_output()
-        .unwrap_or_else(|error| fail(error.to_string()));
-    if !output.status.success() {
+        writer
+            .join()
+            .unwrap_or_else(|_| fail("git batch-check input writer panicked"))
+            .unwrap_or_else(|error| fail(format!("cannot write git batch-check input: {error}")));
+    });
+    let status = child
+        .wait()
+        .unwrap_or_else(|error| fail(format!("cannot wait for git batch-check: {error}")));
+    if !status.success() {
         fail("git cat-file batch-check failed");
     }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let (oid, kind) = line.split_once(' ')?;
-            (kind != "blob").then(|| oid.to_owned())
-        })
-        .collect()
+    result
 }
 
 #[cfg(test)]
@@ -1228,21 +1249,21 @@ fn missing_objects(
     browse_only: bool,
 ) -> Vec<String> {
     let mut missing = Vec::new();
-    let calls = ids
-        .chunks(500)
-        .map(|batch| {
-            let values = batch
-                .iter()
-                .map(|oid| format!("\"{oid}\""))
-                .collect::<Vec<_>>()
-                .join(";");
-            (
-                "missing_objects".into(),
-                format!("(principal \"{owner}\", \"{repo}\", vec {{{values}}}, {browse_only})"),
-            )
-        })
-        .collect();
-    for result in parallel_icp_calls(canister, calls) {
+    let batch_count = object_negotiation_batch_count(ids.len());
+    let mut progress =
+        TransferProgress::new("negotiating objects", "batches", batch_count as u64, 0);
+    let calls = ids.chunks(500).map(|batch| {
+        let values = batch
+            .iter()
+            .map(|oid| format!("\"{oid}\""))
+            .collect::<Vec<_>>()
+            .join(";");
+        (
+            "missing_objects".into(),
+            format!("(principal \"{owner}\", \"{repo}\", vec {{{values}}}, {browse_only})"),
+        )
+    });
+    for_bounded_icp_calls(canister, calls, |result| {
         missing.extend(
             result
                 .get("ok")
@@ -1251,8 +1272,17 @@ fn missing_objects(
                 .iter()
                 .map(|value| value.as_str().unwrap().to_owned()),
         );
-    }
+        progress.advance(1);
+    });
     missing
+}
+
+fn object_negotiation_batch_count(object_count: usize) -> usize {
+    object_count.div_ceil(500)
+}
+
+fn can_skip_missing_object_negotiation(expected_refs: &[(String, String)]) -> bool {
+    expected_refs.is_empty()
 }
 
 fn pack_segment_bytes() -> usize {
@@ -1267,6 +1297,11 @@ fn create_incremental_packs(git_dir: &Path, ids: &[String]) -> Vec<String> {
     if ids.is_empty() {
         return Vec::new();
     }
+    eprintln!(
+        "infinigit: packing {} objects into segments of at most {} bytes",
+        ids.len(),
+        pack_segment_bytes()
+    );
     let pack_dir = git_dir.join("objects/pack");
     fs::create_dir_all(&pack_dir).unwrap_or_else(|error| fail(error.to_string()));
     let base = pack_dir.join("pack");
@@ -1545,12 +1580,19 @@ fn upload(canister: &str, owner: &str, repo: &str, git_dir: &Path) {
     let desired_refs = local_refs(git_dir);
     let changes = candid_ref_changes(&expected_refs, &desired_refs);
     let mut desired_pack_ids = remote_packs.keys().cloned().collect::<Vec<_>>();
+    eprintln!("infinigit: scanning the local Git object graph");
     let candidates = changed_object_ids(git_dir, &expected_refs, &desired_refs);
+    eprintln!("infinigit: found {} candidate objects", candidates.len());
     if candidates.is_empty() && changes.is_empty() {
         timer.mark("up_to_date");
         return;
     }
-    let missing = missing_objects(canister, owner, repo, &candidates, false);
+    let missing = if can_skip_missing_object_negotiation(&expected_refs) {
+        eprintln!("infinigit: empty remote; all candidate objects are new");
+        candidates.clone()
+    } else {
+        missing_objects(canister, owner, repo, &candidates, false)
+    };
     timer.mark("negotiate");
     let compacted = desired_pack_ids.len() >= capabilities.max_retained_packs.saturating_sub(10);
     if compacted {
@@ -2072,6 +2114,30 @@ mod tests {
             vec![("refs/tags/next".into(), second_oid)]
         );
     }
+
+    #[test]
+    fn large_cat_file_batches_drain_output_while_feeding_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let git_dir = directory.path().join("repository.git");
+        run(Command::new("git").args(["init", "--bare", git_dir.to_str().unwrap()]));
+        let fixture = directory.path().join("fixture.txt");
+        fs::write(&fixture, b"pipe deadlock regression\n").unwrap();
+        let oid = String::from_utf8_lossy(
+            &git(&git_dir, &["hash-object", "-w", fixture.to_str().unwrap()]).stdout,
+        )
+        .trim()
+        .to_owned();
+        let ids = vec![oid; 20_000];
+
+        let mut seen = 0;
+        for_each_git_object(&git_dir, &ids, |_, kind, payload| {
+            assert_eq!(kind, "blob");
+            assert_eq!(payload, b"pipe deadlock regression\n");
+            seen += 1;
+        });
+        assert_eq!(seen, ids.len());
+        assert!(non_blob_object_ids(&git_dir, &ids).is_empty());
+    }
     #[test]
     fn emits_only_changed_ref_operations_including_deletions() {
         let expected = vec![
@@ -2137,6 +2203,17 @@ mod tests {
             vec![1, 3, 4]
         );
         assert!(uploaded_chunk_indexes(&serde_json::json!({"err": "missing"})).is_empty());
+    }
+
+    #[test]
+    fn initial_push_skips_unnecessary_per_object_remote_negotiation() {
+        assert!(can_skip_missing_object_negotiation(&[]));
+        assert!(!can_skip_missing_object_negotiation(&[(
+            "refs/heads/main".into(),
+            "ab".repeat(20),
+        )]));
+        assert_eq!(object_negotiation_batch_count(0), 0);
+        assert_eq!(object_negotiation_batch_count(1_000_001), 2_001);
     }
 
     #[test]
